@@ -82,11 +82,11 @@ while true; do
       PRIV_KEY=$(echo "$KEYS" | awk '/PrivateKey:/ {print $2}')
       PUB_KEY=$(echo "$KEYS" | awk '/Password/ {print $2}')
       read -rp "SNI: " SNI
-      read -rp "UUID（留空随机）: " UUID
+      read -rp "UUID(留空随机): " UUID
       if [ -z "$UUID" ]; then
         UUID=$(cat /proc/sys/kernel/random/uuid)
       fi
-      read -rp "shortID（留空随机）: " SHORT_ID
+      read -rp "shortID(留空随机): " SHORT_ID
       if [ -z "$SHORT_ID" ]; then
         SHORT_ID=$(head -c 4 /dev/urandom | xxd -p)
       fi
@@ -129,7 +129,7 @@ EOF
       # 保存到文件（覆盖模式）
       SAVE_PATH="/usr/local/etc/xray/sublink.txt"
       {
-        echo "URI链接："
+        echo "URI链接:"
         echo "$LINK"
         echo
         echo "YAML (proxies):"
