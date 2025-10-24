@@ -191,10 +191,16 @@ while true; do
     3)
       bash <(curl -fsSL https://get.hy2.sh/) --remove
       rm -rf /etc/hysteria
-      userdel -r hysteria
+      if id "hysteria" &>/dev/null; then
+          userdel -r hysteria
+          echo "用户 hysteria 已删除"
+      else
+          echo "用户 hysteria 不存在，跳过删除"
+      fi
       rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service
       rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server@*.service
       systemctl daemon-reload
+      echo "卸载完成"
       read -rp "按任意键返回菜单..."
       ;;
     0)
