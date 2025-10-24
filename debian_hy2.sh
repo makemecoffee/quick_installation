@@ -166,7 +166,7 @@ while true; do
   clear
   echo "1) 安装并配置 Hysteria2"  
   echo "2) 查看节点配置"
-  echo "3) 卸载 Hysteria(测试中)"
+  echo "3) 卸载 Hysteria"
   echo "0) 退出"
   echo
   read -rp "请选择操作: " choice
@@ -190,6 +190,11 @@ while true; do
       ;;
     3)
       bash <(curl -fsSL https://get.hy2.sh/) --remove
+      rm -rf /etc/hysteria
+      userdel -r hysteria
+      rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service
+      rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server@*.service
+      systemctl daemon-reload
       read -rp "按任意键返回菜单..."
       ;;
     0)
