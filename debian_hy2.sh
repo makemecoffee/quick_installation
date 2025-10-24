@@ -5,7 +5,7 @@ green() { echo -e "\033[32m$1\033[0m"; }
 red()   { echo -e "\033[31m$1\033[0m"; }
 yellow() { echo -e "\033[33m$1\033[0m"; } 
 
-# 0. 检查并安装依赖
+# 检查并安装依赖
 install_deps() {
     echo "[0/5] 检测并安装依赖..."
     local deps=(wget git openssh-client openssl curl)
@@ -26,7 +26,7 @@ install_deps() {
     fi
 }
 
-# 1. 获取用户配置
+# 获取用户配置
 get_user_input() {
     read -rp "节点备注: " REMARK
     read -p "请输入监听端口(默认443):" PORT
@@ -44,7 +44,7 @@ get_user_input() {
     MASQ=${MASQ:-https://bing.com/}
 }
 
-# 2. 下载 Hysteria2 程序
+# 下载 Hysteria2 程序
 download_hysteria() {
     echo "[1/5] 下载 Hysteria2 主程序..."
     wget -O /usr/local/bin/hysteria https://download.hysteria.network/app/latest/hysteria-linux-amd64 --no-check-certificate
@@ -52,7 +52,7 @@ download_hysteria() {
     mkdir -p /etc/hysteria
 }
 
-# 3. 生成自签证书
+# 生成自签证书
 generate_cert() {
     local cert_dir=$1
     local cn_name=$2
@@ -63,7 +63,7 @@ generate_cert() {
         -subj "/CN=$cn_name" -days 36500
 }
 
-# 4. 写入配置文件
+# 写入配置文件
 write_config() {
     local config_file=$1
     local port=$2
@@ -89,7 +89,7 @@ masquerade:
 EOF
 }
 
-# 5. 写入 systemd 服务文件
+# 写入 systemd 服务文件
 write_service() {
     cat > /etc/systemd/system/hysteria.service <<EOF
 [Unit]
@@ -106,7 +106,7 @@ WantedBy=multi-user.target
 EOF
 }
 
-# 6. 启动服务
+# 启动服务
 start_service() {
     echo "[5/5] 启动并设置开机自启..."
     systemctl daemon-reload
@@ -114,7 +114,7 @@ start_service() {
     systemctl restart hysteria
 }
 
-# 7. 输出安装信息并生成订阅链接
+# 输出安装信息并生成订阅链接
 show_info() {
     local remark=$1
     local port=$2
@@ -147,18 +147,6 @@ show_info() {
         echo "$YAML"
     } > "$SAVE_PATH"
     cat "$SAVE_PATH"
-}
-
-# ----------------- 主程序 -----------------
-main() {
-    install_deps
-    get_user_input
-    download_hysteria
-    generate_cert /etc/hysteria "$SNI"
-    write_config /etc/hysteria/config.yaml "$PORT" "$PASS" "$MASQ"
-    write_service
-    start_service
-    show_info "$REMARK" "$PORT" "$PASS" "$SNI" "$MASQ"
 }
 
 #====== MEUI======
