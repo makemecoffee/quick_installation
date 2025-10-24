@@ -1,9 +1,28 @@
 #!/bin/bash
 
-apk add --no-cache wget git openssh openssl openrc
+install_deps_alpine() {
+    echo "检测并安装依赖 (Alpine)..."
+    local deps=(wget git openssh openssl openrc)
+    local missing=()
+
+    for pkg in "${deps[@]}"; do
+        if ! apk info -e "$pkg" >/dev/null 2>&1; then
+            missing+=("$pkg")
+        fi
+    done
+
+    if [ ${#missing[@]} -ne 0 ]; then
+        echo "缺少依赖: ${missing[*]}"
+        echo "开始安装..."
+        apk add --no-cache "${missing[@]}"
+    else
+        echo "所有依赖已安装"
+    fi
+}
+
 
 echo "==================== Hysteria2 安装程序 ===================="
-
+install_deps_alpine
 read -rp "节点备注: " REMARK
 read -p "请输入监听端口 [默认443]：" PORT
 PORT=${PORT:-443}
@@ -103,6 +122,7 @@ echo "伪装域名(SNI): $SNI"
 echo "监听端口: $PORT"
 echo "伪装网址(Masquerade): $MASQ"
 echo ""
+echo "查看节点配置：cat /etc/hysteria/sublink.txt"
 echo "查看状态：service hysteria status"
 echo "重启服务：service hysteria restart"
 echo "务必查看状态正常才是搭建完成"
@@ -111,7 +131,13 @@ echo "==================================================="
 IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
 LINK="hysteria2://$PASS@$IP:$PORT/?insecure=1&sni=$SNI#$REMARK"
 YAML="- {name: $REMARK, type: hysteria2, server: $IP, port: $PORT, password: $PASS, udp: true, skip-cert-verify: true }"
-echo "URI链接："
-echo "$LINK"
-echo "yaml(proxies):"
-echo "$YAML"
+# 保存到文件（覆盖模式）
+SAVE_PATH="/etc/hysteria/sublink.txt"
+{
+  echo "URI链接:"
+  echo "$LINK"
+  echo
+  echo "YAML (proxies):"
+  echo "$YAML"
+  } > "$SAVE_PATH"
+cat /etc/hysteria/sublink.txt
