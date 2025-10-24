@@ -88,6 +88,16 @@ rc-service xray restart
 
 IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
 LINK="vless://$UUID@$IP:$PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$SNI&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#$REMARK"
-
-green "链接："
-echo "$LINK"
+YAML="- {name: $REMARK, type: vless, server: $IP, port: $PORT, uuid: $UUID, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: $SNI, client-fingerprint: chrome, reality-opts: {public-key: $PUB_KEY, short-id: $SHORT_ID}}"
+# 保存到文件（覆盖模式）
+SAVE_PATH="/usr/local/etc/xray/sublink.txt"
+{
+  echo "URI链接:"
+  echo "$LINK"
+  echo
+  echo "YAML (proxies):"
+  echo "$YAML"
+} > "$SAVE_PATH"
+cat /usr/local/etc/xray/sublink.txt
+echo ""
+echo "查看节点配置：cat /usr/local/etc/xray/sublink.txt"
