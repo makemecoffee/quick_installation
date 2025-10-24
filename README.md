@@ -29,7 +29,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_hy2.sh)
 ```
 ---
----
 ### Alpine系列
 - VLESS-VISION-REALITY 
 ```sh
