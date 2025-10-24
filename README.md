@@ -17,21 +17,21 @@ apt install -y bash curl
 - Debian的vvr融合开启BBR和卸载xray
 - alpine_hy2安装不成功请自行DD系统再用，无DD教程
 ## 一键安装
-### Alpine安装vvr
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_vvr.sh)
-```
 ### Debian安装vvr
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_vvr.sh)
 ```
-### Alpine安装hy2
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_hy2.sh)
-```
 ### Debian安装hy2
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_hy2.sh)
+```
+### Alpine安装vvr
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_vvr.sh)
+```
+### Alpine安装hy2
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_hy2.sh)
 ```
 ### WARNING
 - Alpine不提供卸载，建议直接重装系统解决（简单粗暴）
