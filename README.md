@@ -19,17 +19,17 @@ apt install -y bash curl
 ## 一键安装
 ### Alpine安装vvr
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/main/alpine_vvr.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_vvr.sh)
 ```
 ### Debian安装vvr
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/main/debian_vvr.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_vvr.sh)
 ```
 ### Alpine安装hy2
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/main/alpine_hy2.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_hy2.sh)
 ```
 ### Debian安装hy2
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/main/debian_hy2.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_hy2.sh)
 ```
