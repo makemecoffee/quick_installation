@@ -200,7 +200,7 @@ while true; do
       rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service
       rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server@*.service
       systemctl daemon-reload
-      echo "卸载完成"
+      echo "卸载完成---以上指令已脚本执行完成无需再次执行"
       read -rp "按任意键返回菜单..."
       ;;
     0)
