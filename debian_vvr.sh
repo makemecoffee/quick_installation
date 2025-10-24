@@ -67,6 +67,7 @@ while true; do
   echo "1) 安装并配置 VLESS Reality Vision节点"  
   echo "2) 开启 BBR 加速"
   echo "3) 卸载 Xray"
+  echo "4) 查看节点配置"
   echo "0) 退出"
   echo
   read -rp "请选择操作: " choice
@@ -124,8 +125,17 @@ EOF
 
       IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
       LINK="vless://$UUID@$IP:$PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$SNI&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#$REMARK"
-      green "链接："
-      echo "$LINK"
+      YAML="- {name: $REMARK, type: vless, server: $IP, port: $PORT, uuid: $UUID, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: $SNI, client-fingerprint: chrome, reality-opts: {public-key: $PUB_KEY, short-id: $SHORT_ID}}"
+      # 保存到文件（覆盖模式）
+      SAVE_PATH="/usr/local/etc/xray/sublink.txt"
+      {
+        echo "URI链接："
+        echo "$LINK"
+        echo
+        echo "YAML (proxies):"
+        echo "$YAML"
+      } > "$SAVE_PATH"
+      cat /usr/local/etc/xray/sublink.txt
       read -rp "按任意键返回菜单..."
       ;;
     2)
@@ -137,6 +147,9 @@ EOF
       bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge
       green "Xray 已卸载"
       read -rp "按任意键返回菜单..."
+      ;;
+    4)
+      cat /usr/local/etc/xray/sublink.txt
       ;;
     0)
       exit 0
