@@ -33,3 +33,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_hy2.sh)
 ```
+### WARNING
+- Alpine不提供卸载，建议直接重装系统解决（简单粗暴）
