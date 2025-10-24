@@ -150,6 +150,7 @@ EOF
       ;;
     4)
       cat /usr/local/etc/xray/sublink.txt
+      read -rp "按任意键返回菜单..."
       ;;
     0)
       exit 0
