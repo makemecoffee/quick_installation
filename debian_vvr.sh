@@ -120,8 +120,8 @@ while true; do
 EOF
 
 	      systemctl daemon-reexec
-          systemctl restart xray
-          systemctl enable xray
+        systemctl restart xray
+        systemctl enable xray
 
       IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
       LINK="vless://$UUID@$IP:$PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$SNI&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#$REMARK"
