@@ -99,7 +99,7 @@ while true; do
     "port": $PORT,
     "protocol": "vless",
     "settings": {
-      "clients": [{ "id": "$UUID", "email": "$REMARK" , "flow": "xtls-rprx-vision"}],
+      "clients": [{ "id": "$UUID", "email": "admin@xray.com" , "flow": "xtls-rprx-vision"}],
       "decryption": "none"
     },
     "streamSettings": {
