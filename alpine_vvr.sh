@@ -76,7 +76,8 @@ cat > /usr/local/etc/xray/config.json <<EOF
         "serverNames": ["$SNI"],
         "privateKey": "$PRIV_KEY",
         "shortIds": ["$SHORT_ID"]
-      }
+      },
+      "tag": "vless"
     }
   }],
   "outbounds": [{ "protocol": "freedom" }]

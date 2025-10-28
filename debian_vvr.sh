@@ -112,7 +112,8 @@ while true; do
         "serverNames": ["$SNI"],
         "privateKey": "$PRIV_KEY",
         "shortIds": ["$SHORT_ID"]
-      }
+      },
+      "tag": "vless"
     }
   }],
   "outbounds": [{ "protocol": "freedom" }]
