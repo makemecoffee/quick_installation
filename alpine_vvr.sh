@@ -158,7 +158,7 @@ main_menu() {
     echo "===================="
     green "  Xray 管理脚本菜单"
     echo "===================="
-    echo "1) 安装并配置 Xray"
+    echo "1) 安装Xray并配置vless_reality_vision "
     echo "2) 重启 Xray"
     echo "3) 卸载 Xray"
     echo "4) 查看节点信息"
