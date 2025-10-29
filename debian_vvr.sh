@@ -23,8 +23,6 @@ install_dependencies() {
   green "依赖检测完成"
 }
 
-install_dependencies
-
 #====== Check if xray is installed =====
 check_and_install_xray() {
   if command -v xray >/dev/null 2>&1; then
@@ -61,38 +59,25 @@ enable_bbr() {
   fi
 }
 
-#====== MEUI======
-while true; do
-  clear
-  echo "1) 安装并配置 VLESS Reality Vision节点"  
-  echo "2) 开启 BBR 加速"
-  echo "3) 卸载 Xray"
-  echo "4) 查看节点配置"
-  echo "0) 退出"
-  echo
-  read -rp "请选择操作: " choice
+create_xray_vless_reality() {
+  XRAY_BIN=$(command -v xray || echo "/usr/local/bin/xray")
+  read -rp "监听端口: " PORT
+  read -rp "节点备注: " REMARK
+  KEYS=$($XRAY_BIN x25519)
+  PRIV_KEY=$(echo "$KEYS" | awk '/PrivateKey:/ {print $2}')
+  PUB_KEY=$(echo "$KEYS" | awk '/Password/ {print $2}')
+  read -rp "SNI: " SNI
+  read -rp "UUID(留空随机): " UUID
+  if [ -z "$UUID" ]; then
+    UUID=$(cat /proc/sys/kernel/random/uuid)
+  fi
+  read -rp "shortID(留空随机): " SHORT_ID
+  if [ -z "$SHORT_ID" ]; then
+    SHORT_ID=$(head -c 4 /dev/urandom | xxd -p)
+  fi
 
-  case "$choice" in
-    1)
-      check_and_install_xray
-      XRAY_BIN=$(command -v xray || echo "/usr/local/bin/xray")
-      read -rp "监听端口: " PORT
-      read -rp "节点备注: " REMARK
-      KEYS=$($XRAY_BIN x25519)
-      PRIV_KEY=$(echo "$KEYS" | awk '/PrivateKey:/ {print $2}')
-      PUB_KEY=$(echo "$KEYS" | awk '/Password/ {print $2}')
-      read -rp "SNI: " SNI
-      read -rp "UUID(留空随机): " UUID
-      if [ -z "$UUID" ]; then
-        UUID=$(cat /proc/sys/kernel/random/uuid)
-      fi
-      read -rp "shortID(留空随机): " SHORT_ID
-      if [ -z "$SHORT_ID" ]; then
-        SHORT_ID=$(head -c 4 /dev/urandom | xxd -p)
-      fi
-
-      mkdir -p /usr/local/etc/xray
-      cat > /usr/local/etc/xray/config.json <<EOF
+  mkdir -p /usr/local/etc/xray
+  cat > /usr/local/etc/xray/config.json <<EOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{
@@ -120,23 +105,45 @@ while true; do
 }
 EOF
 
-	      systemctl daemon-reexec
-        systemctl restart xray
-        systemctl enable xray
+  systemctl daemon-reexec
+  systemctl restart xray
+  systemctl enable xray
 
-      IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
-      LINK="vless://$UUID@$IP:$PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$SNI&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#$REMARK"
-      YAML="- {name: $REMARK, type: vless, server: $IP, port: $PORT, uuid: $UUID, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: $SNI, client-fingerprint: chrome, reality-opts: {public-key: $PUB_KEY, short-id: $SHORT_ID}}"
-      # 保存到文件（覆盖模式）
-      SAVE_PATH="/usr/local/etc/xray/sublink.txt"
-      {
-        echo "URI链接:"
-        echo "$LINK"
-        echo
-        echo "YAML (proxies):"
-        echo "$YAML"
-      } > "$SAVE_PATH"
-      cat /usr/local/etc/xray/sublink.txt
+  IP=$(curl -s ipv4.ip.sb || curl -s ifconfig.me)
+  LINK="vless://$UUID@$IP:$PORT?type=tcp&security=reality&flow=xtls-rprx-vision&sni=$SNI&fp=chrome&pbk=$PUB_KEY&sid=$SHORT_ID#$REMARK"
+  YAML="- {name: $REMARK, type: vless, server: $IP, port: $PORT, uuid: $UUID, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: $SNI, client-fingerprint: chrome, reality-opts: {public-key: $PUB_KEY, short-id: $SHORT_ID}}"
+
+  # 保存到文件（覆盖模式）
+  SAVE_PATH="/usr/local/etc/xray/sublink.txt"
+  {
+    echo "URI链接:"
+    echo "$LINK"
+    echo
+    echo "YAML (proxies):"
+    echo "$YAML"
+  } > "$SAVE_PATH"
+
+  cat /usr/local/etc/xray/sublink.txt
+}
+
+
+#====== MEUI======
+while true; do
+  clear
+  echo "1) 安装Xray并配置 VLESS Reality Vision节点"  
+  echo "2) 开启 BBR 加速"
+  echo "3) 卸载 Xray"
+  echo "4) 查看节点配置"
+  echo "5) 重启Xray"
+  echo "0) 退出"
+  echo
+  read -rp "请选择操作: " choice
+
+  case "$choice" in
+    1)
+      install_dependencies
+      check_and_install_xray
+      create_xray_vless_reality
       read -rp "按任意键返回菜单..."
       ;;
     2)
@@ -151,6 +158,10 @@ EOF
       ;;
     4)
       cat /usr/local/etc/xray/sublink.txt
+      read -rp "按任意键返回菜单..."
+      ;;
+    5)
+      systemctl restart xray
       read -rp "按任意键返回菜单..."
       ;;
     0)
