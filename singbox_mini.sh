@@ -23,7 +23,7 @@ YAML_NODES_FILE="${SINGBOX_DIR}/clash_nodes.yaml"
 NODES_META_FILE="${SINGBOX_DIR}/nodes_meta.json"  # 新增：存储节点元数据
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 SCRIPT_VERSION="1.0"
-SCRIPT_PATH="/usr/local/bin/sbl"  # 添加脚本路径常量
+SCRIPT_PATH="/usr/local/bin/sbm"  # 修改：从 sbl 改为 sbm
 
 # --- 全局变量 ---
 SERVER_IP=""
@@ -570,7 +570,7 @@ _delete_node() {
 }
 
 _create_global_command() {
-    _info "正在创建全局命令 'sbl'..."
+    _info "正在创建全局命令 'sbm'..."
     
     # 检查当前脚本是否是通过管道执行（如 bash <(curl ...)）
     if [[ "$0" =~ ^/dev/fd/ ]] || [[ "$0" == "bash" ]] || [[ ! -f "$0" ]]; then
@@ -580,7 +580,7 @@ _create_global_command() {
         
         if curl -fsSL "$script_url" -o "$SCRIPT_PATH" 2>/dev/null; then
             chmod +x "$SCRIPT_PATH"
-            _success "全局命令已创建！现在可以使用 'sbl' 命令"
+            _success "全局命令已创建！现在可以使用 'sbm' 命令"
         else
             _warning "警告: 下载脚本失败，无法创建全局命令"
             _info "你可以手动运行: curl -fsSL $script_url -o $SCRIPT_PATH && chmod +x $SCRIPT_PATH"
@@ -590,7 +590,7 @@ _create_global_command() {
         if [ ! -f "$SCRIPT_PATH" ] || ! diff -q "$0" "$SCRIPT_PATH" &>/dev/null; then
             cp -f "$0" "$SCRIPT_PATH"
             chmod +x "$SCRIPT_PATH"
-            _success "全局命令已创建！现在可以使用 'sbl' 命令"
+            _success "全局命令已创建！现在可以使用 'sbm' 命令"
         fi
     fi
 }
