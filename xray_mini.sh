@@ -292,18 +292,31 @@ _add_vless_reality() {
     _info "正在生成密钥对..."
     local keys=$($XRAY_BIN x25519)
     
-    # 调试输出（可选）
-    # echo "DEBUG: keys output = $keys"
+    # 调试输出 - 查看实际格式
+    echo "DEBUG: 密钥输出:"
+    echo "$keys"
+    echo "---"
     
-    # 更健壮的密钥提取方式
-    local priv_key=$(echo "$keys" | grep -i "private key" | awk '{print $NF}')
-    local pub_key=$(echo "$keys" | grep -i "public key" | awk '{print $NF}')
+    # 尝试多种提取方式
+    local priv_key=$(echo "$keys" | awk '/Private key:/ {print $3}')
+    local pub_key=$(echo "$keys" | awk '/Public key:/ {print $3}')
     
-    # 如果第一种方式失败，尝试其他格式
+    # 备用方案1: 按行号提取
     if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
-        priv_key=$(echo "$keys" | sed -n 's/.*[Pp]rivate.*: *\([^ ]*\).*/\1/p' | head -1)
-        pub_key=$(echo "$keys" | sed -n 's/.*[Pp]ublic.*: *\([^ ]*\).*/\1/p' | head -1)
+        priv_key=$(echo "$keys" | sed -n '1p' | awk '{print $NF}')
+        pub_key=$(echo "$keys" | sed -n '2p' | awk '{print $NF}')
     fi
+    
+    # 备用方案2: 使用 grep
+    if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
+        priv_key=$(echo "$keys" | grep -i private | awk '{print $NF}')
+        pub_key=$(echo "$keys" | grep -i public | awk '{print $NF}')
+    fi
+    
+    echo "DEBUG: 提取结果:"
+    echo "Private: $priv_key"
+    echo "Public: $pub_key"
+    echo "---"
     
     # 验证密钥是否成功生成
     if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
