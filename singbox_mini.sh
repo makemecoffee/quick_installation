@@ -20,7 +20,7 @@ CONFIG_FILE="${SINGBOX_DIR}/config.json"
 YAML_NODES_FILE="${SINGBOX_DIR}/clash_nodes.yaml"
 NODES_META_FILE="${SINGBOX_DIR}/nodes_meta.json" 
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
-SCRIPT_VERSION="1.0"
+SCRIPT_VERSION="1.1"
 SCRIPT_PATH="/usr/local/bin/sbm" 
 
 # --- 全局变量 ---
@@ -62,6 +62,42 @@ _get_public_ip() {
     _success "公网 IP: ${SERVER_IP}"
 }
 
+# 验证端口号
+_validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        _error "无效的端口号: ${port} (有效范围: 1-65535)"
+    fi
+    
+    # 检查端口是否已被占用
+    if jq -e ".inbounds[] | select(.listen_port == ${port})" "$CONFIG_FILE" >/dev/null 2>&1; then
+        _error "端口 ${port} 已被使用，请选择其他端口"
+    fi
+}
+
+# 验证 UUID 格式
+_validate_uuid() {
+    local uuid="$1"
+    if ! [[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        _error "无效的 UUID 格式: ${uuid}"
+    fi
+}
+
+# 跨平台 base64 编码（无换行）
+_base64_encode() {
+    if command -v base64 &>/dev/null; then
+        if base64 --help 2>&1 | grep -q -- '-w'; then
+            # GNU base64
+            echo -n "$1" | base64 -w0
+        else
+            # BSD/Alpine base64
+            echo -n "$1" | base64 | tr -d '\n'
+        fi
+    else
+        _error "base64 命令不可用"
+    fi
+}
+
 _install_dependencies() {
     _info "检查依赖..."
     
@@ -80,8 +116,8 @@ _install_dependencies() {
         fi
         
         _info "需要安装: ${missing_deps[*]}"
-        apk update
-        apk add --no-cache "${missing_deps[@]}"
+        apk update || _error "apk update 失败"
+        apk add --no-cache "${missing_deps[@]}" || _error "依赖安装失败"
     else
         # 检查 Debian/Ubuntu 依赖
         local missing_deps=()
@@ -97,8 +133,8 @@ _install_dependencies() {
         fi
         
         _info "需要安装: ${missing_deps[*]}"
-        apt-get update
-        apt-get install -y "${missing_deps[@]}"
+        apt-get update || _error "apt-get update 失败"
+        apt-get install -y "${missing_deps[@]}" || _error "依赖安装失败"
     fi
     
     _success "依赖安装完成"
@@ -125,9 +161,9 @@ _install_singbox() {
     
     [ -z "$download_url" ] && _error "无法获取下载链接"
     
-    wget -qO /tmp/singbox.tar.gz "$download_url"
-    tar -xzf /tmp/singbox.tar.gz -C /tmp
-    mv /tmp/sing-box-*/sing-box "$SINGBOX_BIN"
+    wget -qO /tmp/singbox.tar.gz "$download_url" || _error "下载失败"
+    tar -xzf /tmp/singbox.tar.gz -C /tmp || _error "解压失败"
+    mv /tmp/sing-box-*/sing-box "$SINGBOX_BIN" || _error "安装失败"
     chmod +x "$SINGBOX_BIN"
     rm -rf /tmp/singbox.tar.gz /tmp/sing-box-*
     
@@ -231,12 +267,40 @@ _save_node_meta() {
     fi
     
     local temp=$(mktemp)
-    jq ".nodes += [{
-        \"tag\": \"${tag}\",
-        \"share_link\": \"${share_link}\",
-        \"yaml_config\": \"${yaml_config}\",
-        \"created_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-    }]" "$NODES_META_FILE" > "$temp" && mv "$temp" "$NODES_META_FILE"
+    jq --arg tag "$tag" \
+       --arg link "$share_link" \
+       --arg yaml "$yaml_config" \
+       --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       '.nodes += [{
+           "tag": $tag,
+           "share_link": $link,
+           "yaml_config": $yaml,
+           "created_at": $time
+       }]' "$NODES_META_FILE" > "$temp" && mv "$temp" "$NODES_META_FILE"
+}
+
+# 生成自签名证书（兼容方式）
+_generate_self_signed_cert() {
+    local cert_path="$1"
+    local key_path="$2"
+    local sni="$3"
+    
+    # 先生成 EC 参数文件
+    local param_file=$(mktemp)
+    openssl ecparam -name prime256v1 -out "$param_file" || {
+        rm -f "$param_file"
+        _error "生成 EC 参数失败"
+    }
+    
+    # 使用参数文件生成证书
+    openssl req -x509 -nodes -newkey ec:"$param_file" \
+        -keyout "$key_path" -out "$cert_path" \
+        -subj "/CN=${sni}" -days 3650 2>/dev/null || {
+        rm -f "$param_file"
+        _error "生成证书失败"
+    }
+    
+    rm -f "$param_file"
 }
 
 _add_vless_reality() {
@@ -247,6 +311,7 @@ _add_vless_reality() {
     
     read -p "监听端口 (默认: 443): " port
     port=${port:-443}
+    _validate_port "$port"
     
     # 如果用户没有输入 tag，使用默认格式
     local tag="${custom_tag:-vless-reality-${port}}"
@@ -255,11 +320,21 @@ _add_vless_reality() {
     sni=${sni:-www.microsoft.com}
     
     # UUID 可选手动输入
-    read -p "UUID (回车自动生成): " uuid
-    if [ -z "$uuid" ]; then
-        uuid=$(${SINGBOX_BIN} generate uuid)
-        _info "已自动生成 UUID: ${uuid}"
-    fi
+    local uuid=""
+    while true; do
+        read -p "UUID (回车自动生成): " uuid
+        if [ -z "$uuid" ]; then
+            uuid=$(${SINGBOX_BIN} generate uuid)
+            _info "已自动生成 UUID: ${uuid}"
+            break
+        else
+            if _validate_uuid "$uuid" 2>/dev/null; then
+                break
+            else
+                _warning "UUID 格式错误，请重新输入或直接回车自动生成"
+            fi
+        fi
+    done
     
     local keypair=$(${SINGBOX_BIN} generate reality-keypair)
     local private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
@@ -268,29 +343,35 @@ _add_vless_reality() {
     
     # 添加 inbound
     local temp=$(mktemp)
-    jq ".inbounds += [{
-        \"type\": \"vless\",
-        \"tag\": \"${tag}\",
-        \"listen\": \"::\",
-        \"listen_port\": ${port},
-        \"users\": [{
-            \"uuid\": \"${uuid}\",
-            \"flow\": \"xtls-rprx-vision\"
-        }],
-        \"tls\": {
-            \"enabled\": true,
-            \"server_name\": \"${sni}\",
-            \"reality\": {
-                \"enabled\": true,
-                \"handshake\": {
-                    \"server\": \"${sni}\",
-                    \"server_port\": 443
-                },
-                \"private_key\": \"${private_key}\",
-                \"short_id\": [\"${short_id}\"]
-            }
-        }
-    }]" "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+    jq --arg tag "$tag" \
+       --argjson port "$port" \
+       --arg uuid "$uuid" \
+       --arg sni "$sni" \
+       --arg priv_key "$private_key" \
+       --arg short_id "$short_id" \
+       '.inbounds += [{
+           "type": "vless",
+           "tag": $tag,
+           "listen": "::",
+           "listen_port": $port,
+           "users": [{
+               "uuid": $uuid,
+               "flow": "xtls-rprx-vision"
+           }],
+           "tls": {
+               "enabled": true,
+               "server_name": $sni,
+               "reality": {
+                   "enabled": true,
+                   "handshake": {
+                       "server": $sni,
+                       "server_port": 443
+                   },
+                   "private_key": $priv_key,
+                   "short_id": [$short_id]
+               }
+           }
+       }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
     # 生成分享链接和 YAML（使用用户自定义的 tag）
     local share_link="vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#${tag}"
@@ -319,6 +400,7 @@ _add_hysteria2() {
     
     read -p "监听端口: " port
     [ -z "$port" ] && _error "端口不能为空"
+    _validate_port "$port"
     
     local tag="${custom_tag:-hy2-${port}}"
     
@@ -335,25 +417,28 @@ _add_hysteria2() {
     local cert_path="${SINGBOX_DIR}/hy2-${port}.crt"
     local key_path="${SINGBOX_DIR}/hy2-${port}.key"
     
-    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-        -keyout "$key_path" -out "$cert_path" -subj "/CN=${sni}" \
-        -days 3650 &>/dev/null
+    _generate_self_signed_cert "$cert_path" "$key_path" "$sni"
     
     # 添加 inbound
     local temp=$(mktemp)
-    jq ".inbounds += [{
-        \"type\": \"hysteria2\",
-        \"tag\": \"${tag}\",
-        \"listen\": \"::\",
-        \"listen_port\": ${port},
-        \"users\": [{\"password\": \"${password}\"}],
-        \"tls\": {
-            \"enabled\": true,
-            \"alpn\": [\"h3\"],
-            \"certificate_path\": \"${cert_path}\",
-            \"key_path\": \"${key_path}\"
-        }
-    }]" "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+    jq --arg tag "$tag" \
+       --argjson port "$port" \
+       --arg password "$password" \
+       --arg cert "$cert_path" \
+       --arg key "$key_path" \
+       '.inbounds += [{
+           "type": "hysteria2",
+           "tag": $tag,
+           "listen": "::",
+           "listen_port": $port,
+           "users": [{"password": $password}],
+           "tls": {
+               "enabled": true,
+               "alpn": ["h3"],
+               "certificate_path": $cert,
+               "key_path": $key
+           }
+       }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
     local share_link="hysteria2://${password}@${SERVER_IP}:${port}?sni=${sni}&insecure=1#${tag}"
     local yaml_config="- {name: ${tag}, type: hysteria2, server: ${SERVER_IP}, port: ${port}, password: ${password}, udp: true, skip-cert-verify: true, sni: ${sni}}"
@@ -379,15 +464,26 @@ _add_tuic() {
     
     read -p "监听端口: " port
     [ -z "$port" ] && _error "端口不能为空"
+    _validate_port "$port"
     
     local tag="${custom_tag:-tuic-${port}}"
     
     # UUID 可选手动输入
-    read -p "UUID (回车自动生成): " uuid
-    if [ -z "$uuid" ]; then
-        uuid=$(${SINGBOX_BIN} generate uuid)
-        _info "已自动生成 UUID: ${uuid}"
-    fi
+    local uuid=""
+    while true; do
+        read -p "UUID (回车自动生成): " uuid
+        if [ -z "$uuid" ]; then
+            uuid=$(${SINGBOX_BIN} generate uuid)
+            _info "已自动生成 UUID: ${uuid}"
+            break
+        else
+            if _validate_uuid "$uuid" 2>/dev/null; then
+                break
+            else
+                _warning "UUID 格式错误，请重新输入或直接回车自动生成"
+            fi
+        fi
+    done
     
     # 密码可选手动输入
     read -p "密码 (回车自动生成): " password
@@ -402,29 +498,33 @@ _add_tuic() {
     local cert_path="${SINGBOX_DIR}/tuic-${port}.crt"
     local key_path="${SINGBOX_DIR}/tuic-${port}.key"
     
-    openssl req -x509 -nodes -newkey ec:<(openssl ecparam -name prime256v1) \
-        -keyout "$key_path" -out "$cert_path" -subj "/CN=${sni}" \
-        -days 3650 &>/dev/null
+    _generate_self_signed_cert "$cert_path" "$key_path" "$sni"
     
     # 添加 inbound
     local temp=$(mktemp)
-    jq ".inbounds += [{
-        \"type\": \"tuic\",
-        \"tag\": \"${tag}\",
-        \"listen\": \"::\",
-        \"listen_port\": ${port},
-        \"users\": [{
-            \"uuid\": \"${uuid}\",
-            \"password\": \"${password}\"
-        }],
-        \"congestion_control\": \"bbr\",
-        \"tls\": {
-            \"enabled\": true,
-            \"alpn\": [\"h3\"],
-            \"certificate_path\": \"${cert_path}\",
-            \"key_path\": \"${key_path}\"
-        }
-    }]" "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+    jq --arg tag "$tag" \
+       --argjson port "$port" \
+       --arg uuid "$uuid" \
+       --arg password "$password" \
+       --arg cert "$cert_path" \
+       --arg key "$key_path" \
+       '.inbounds += [{
+           "type": "tuic",
+           "tag": $tag,
+           "listen": "::",
+           "listen_port": $port,
+           "users": [{
+               "uuid": $uuid,
+               "password": $password
+           }],
+           "congestion_control": "bbr",
+           "tls": {
+               "enabled": true,
+               "alpn": ["h3"],
+               "certificate_path": $cert,
+               "key_path": $key
+           }
+       }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
     local share_link="tuic://${uuid}:${password}@${SERVER_IP}:${port}?sni=${sni}&congestion_control=bbr&alpn=h3&allow_insecure=1#${tag}"
     local yaml_config="- {name: ${tag}, type: tuic, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, password: ${password}, udp: true, sni: ${sni}, skip-cert-verify: true, congestion-controller: bbr, alpn: [h3]}"
@@ -450,6 +550,7 @@ _add_shadowsocks2022() {
     
     read -p "监听端口: " port
     [ -z "$port" ] && _error "端口不能为空"
+    _validate_port "$port"
     
     local tag="${custom_tag:-ss2022-${port}}"
     
@@ -462,16 +563,20 @@ _add_shadowsocks2022() {
     
     # 添加 inbound
     local temp=$(mktemp)
-    jq ".inbounds += [{
-        \"type\": \"shadowsocks\",
-        \"tag\": \"${tag}\",
-        \"listen\": \"::\",
-        \"listen_port\": ${port},
-        \"method\": \"2022-blake3-aes-128-gcm\",
-        \"password\": \"${password}\"
-    }]" "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+    jq --arg tag "$tag" \
+       --argjson port "$port" \
+       --arg password "$password" \
+       '.inbounds += [{
+           "type": "shadowsocks",
+           "tag": $tag,
+           "listen": "::",
+           "listen_port": $port,
+           "method": "2022-blake3-aes-128-gcm",
+           "password": $password
+       }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
-    local share_link="ss://$(echo -n "2022-blake3-aes-128-gcm:${password}" | base64 -w0)@${SERVER_IP}:${port}#${tag}"
+    local encoded_config=$(_base64_encode "2022-blake3-aes-128-gcm:${password}")
+    local share_link="ss://${encoded_config}@${SERVER_IP}:${port}#${tag}"
     local yaml_config="- {name: ${tag}, type: ss, server: ${SERVER_IP}, port: ${port}, cipher: 2022-blake3-aes-128-gcm, password: ${password}, udp: true}"
     
     _save_node_meta "$tag" "$share_link" "$yaml_config"
@@ -508,7 +613,7 @@ _view_nodes() {
         local yaml_config=""
         
         if [ -f "$NODES_META_FILE" ]; then
-            local meta=$(jq -r ".nodes[] | select(.tag == \"${tag}\")" "$NODES_META_FILE" 2>/dev/null || echo "")
+            local meta=$(jq --arg tag "$tag" '.nodes[] | select(.tag == $tag)' "$NODES_META_FILE" 2>/dev/null || echo "")
             share_link=$(echo "$meta" | jq -r '.share_link // empty' 2>/dev/null || echo "")
             yaml_config=$(echo "$meta" | jq -r '.yaml_config // empty' 2>/dev/null || echo "")
         fi
@@ -617,7 +722,7 @@ _delete_node() {
     # 删除元数据文件中的节点（如果文件存在）
     if [ -f "$NODES_META_FILE" ]; then
         local temp_meta=$(mktemp)
-        jq "del(.nodes[] | select(.tag == \"${tag}\"))" "$NODES_META_FILE" > "$temp_meta" && mv "$temp_meta" "$NODES_META_FILE"
+        jq --arg tag "$tag" 'del(.nodes[] | select(.tag == $tag))' "$NODES_META_FILE" > "$temp_meta" && mv "$temp_meta" "$NODES_META_FILE"
     fi
     
     _success "节点 ${tag} 已删除"
