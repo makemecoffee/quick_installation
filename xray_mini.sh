@@ -288,39 +288,33 @@ _add_vless_reality() {
         short_id=$(head -c 4 /dev/urandom | xxd -p)
     fi
     
-    # 生成密钥对 - 修复版本
+    # 生成密钥对 - 最终版（更健壮的提取，支持多种输出格式）
     _info "正在生成密钥对..."
-    local keys=$($XRAY_BIN x25519)
+    local keys
+    keys=$($XRAY_BIN x25519 2>/dev/null || true)
     
-    # 调试输出 - 查看实际格式
-    echo "DEBUG: 密钥输出:"
-    echo "$keys"
-    echo "---"
+    local priv_key="" pub_key=""
     
-    # 尝试多种提取方式
-    local priv_key=$(echo "$keys" | awk '/Private key:/ {print $3}')
-    local pub_key=$(echo "$keys" | awk '/Public key:/ {print $3}')
+    # 常见格式提取（PrivateKey / Private Key / Private key）
+    priv_key=$(echo "$keys" | sed -n 's/.*[Pp]rivate[ _-]*[Kk]ey.*[:= \t]*\([^[:space:]]*\).*/\1/p' | head -n1)
+    # 公钥有时标为 PublicKey / Public key / Password（某些 xray 版本）
+    pub_key=$(echo "$keys" | sed -n 's/.*\([Pp]ublic\|[Pp]assword\)[ _-]*[Kk]ey.*[:= \t]*\([^[:space:]]*\).*/\2/p' | head -n1)
     
-    # 备用方案1: 按行号提取
+    # 备用：grep+awk 提取最后字段
     if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
-        priv_key=$(echo "$keys" | sed -n '1p' | awk '{print $NF}')
-        pub_key=$(echo "$keys" | sed -n '2p' | awk '{print $NF}')
+        priv_key=$(echo "$keys" | grep -i private 2>/dev/null | awk '{print $NF}' | head -n1 || true)
+        pub_key=$(echo "$keys" | grep -i public 2>/dev/null | awk '{print $NF}' | head -n1 || true)
     fi
     
-    # 备用方案2: 使用 grep
+    # 备用：按行号提取（某些输出为两行）
     if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
-        priv_key=$(echo "$keys" | grep -i private | awk '{print $NF}')
-        pub_key=$(echo "$keys" | grep -i public | awk '{print $NF}')
+        priv_key=$(echo "$keys" | sed -n '1p' | awk '{print $NF}' || true)
+        pub_key=$(echo "$keys" | sed -n '2p' | awk '{print $NF}' || true)
     fi
     
-    echo "DEBUG: 提取结果:"
-    echo "Private: $priv_key"
-    echo "Public: $pub_key"
-    echo "---"
-    
-    # 验证密钥是否成功生成
+    # 最终校验
     if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
-        _error "密钥生成失败，请检查 xray 是否正确安装"
+        _error "密钥生成或解析失败，请检查 xray 二进制是否可用：$XRAY_BIN"
     fi
     
     _success "密钥对生成成功"
@@ -662,7 +656,33 @@ _uninstall() {
     exit 0
 }
 
+_fix_permissions() {
+    # 修复配置文件权限
+    if [ -d "$XRAY_DIR" ]; then
+        chmod 755 "$XRAY_DIR"
+        _info "✓ 目录权限已修复"
+    fi
+    
+    if [ -f "$CONFIG_FILE" ]; then
+        chmod 644 "$CONFIG_FILE"
+        _info "✓ 配置文件权限已修复"
+    fi
+    
+    if [ -f "$NODES_META_FILE" ]; then
+        chmod 644 "$NODES_META_FILE"
+        _info "✓ 元数据文件权限已修复"
+    fi
+    
+    if [ -f "$YAML_NODES_FILE" ]; then
+        chmod 644 "$YAML_NODES_FILE"
+        _info "✓ YAML 文件权限已修复"
+    fi
+}
+
 _restart_service() {
+    # 重启前先修复权限
+    _fix_permissions
+    
     if [ "$OS_TYPE" = "alpine" ]; then
         rc-service xray restart 2>/dev/null || {
             # 如果服务未启动，则启动它
@@ -756,11 +776,12 @@ _main_menu() {
         echo " 5) 重启服务"
         echo " 6) 查看运行状态"
         echo " 7) 启用 BBR 加速"
+        echo " 9) 修复文件权限"
         echo "--------------------------------------------"
         echo " 8) 完全卸载 Xray"
         echo " 0) 退出"
         echo "============================================"
-        read -p "请选择 [0-8]: " choice
+        read -p "请选择 [0-9]: " choice
         
         case $choice in
             1) _add_vless_reality; _restart_service ;;
@@ -771,6 +792,7 @@ _main_menu() {
             6) _view_status ;;
             7) _enable_bbr ;;
             8) _uninstall ;;
+            9) _fix_permissions; _restart_service ;;
             0) exit 0 ;;
             *) _warning "无效选项" ;;
         esac
