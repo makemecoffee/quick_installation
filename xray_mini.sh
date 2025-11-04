@@ -290,8 +290,8 @@ _add_vless_reality() {
     
     # 生成密钥对
     local keys=$($XRAY_BIN x25519)
-    local priv_key=$(echo "$keys" | grep "Private key" | awk '{print $3}')
-    local pub_key=$(echo "$keys" | grep "Public key" | awk '{print $3}')
+    local priv_key=$(echo "$keys" | grep -i "private" | cut -d: -f2 | tr -d ' ')
+    local pub_key=$(echo "$keys" | grep -i "public" | cut -d: -f2 | tr -d ' ')
     
     # 添加 inbound
     local temp=$(mktemp)
