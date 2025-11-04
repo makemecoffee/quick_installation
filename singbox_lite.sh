@@ -196,6 +196,11 @@ _save_node_meta() {
     local share_link="$2"
     local yaml_config="$3"
     
+    # 确保元数据文件存在
+    if [ ! -f "$NODES_META_FILE" ]; then
+        echo '{"nodes":[]}' > "$NODES_META_FILE"
+    fi
+    
     local temp=$(mktemp)
     jq ".nodes += [{
         \"tag\": \"${tag}\",
