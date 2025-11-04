@@ -288,10 +288,29 @@ _add_vless_reality() {
         short_id=$(head -c 4 /dev/urandom | xxd -p)
     fi
     
-    # 生成密钥对
+    # 生成密钥对 - 修复版本
+    _info "正在生成密钥对..."
     local keys=$($XRAY_BIN x25519)
-    local priv_key=$(echo "$keys" | grep -i "private" | cut -d: -f2 | tr -d ' ')
-    local pub_key=$(echo "$keys" | grep -i "public" | cut -d: -f2 | tr -d ' ')
+    
+    # 调试输出（可选）
+    # echo "DEBUG: keys output = $keys"
+    
+    # 更健壮的密钥提取方式
+    local priv_key=$(echo "$keys" | grep -i "private key" | awk '{print $NF}')
+    local pub_key=$(echo "$keys" | grep -i "public key" | awk '{print $NF}')
+    
+    # 如果第一种方式失败，尝试其他格式
+    if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
+        priv_key=$(echo "$keys" | sed -n 's/.*[Pp]rivate.*: *\([^ ]*\).*/\1/p' | head -1)
+        pub_key=$(echo "$keys" | sed -n 's/.*[Pp]ublic.*: *\([^ ]*\).*/\1/p' | head -1)
+    fi
+    
+    # 验证密钥是否成功生成
+    if [ -z "$priv_key" ] || [ -z "$pub_key" ]; then
+        _error "密钥生成失败，请检查 xray 是否正确安装"
+    fi
+    
+    _success "密钥对生成成功"
     
     # 添加 inbound
     local temp=$(mktemp)
