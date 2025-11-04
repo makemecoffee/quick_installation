@@ -443,10 +443,15 @@ _view_nodes() {
         local type=$(echo "$inbound" | jq -r '.type')
         local port=$(echo "$inbound" | jq -r '.listen_port')
         
-        # 从元数据文件获取分享链接
-        local meta=$(jq -r ".nodes[] | select(.tag == \"${tag}\")" "$NODES_META_FILE" 2>/dev/null)
-        local share_link=$(echo "$meta" | jq -r '.share_link // empty')
-        local yaml_config=$(echo "$meta" | jq -r '.yaml_config // empty')
+        # 从元数据文件获取分享链接（检查文件是否存在）
+        local share_link=""
+        local yaml_config=""
+        
+        if [ -f "$NODES_META_FILE" ]; then
+            local meta=$(jq -r ".nodes[] | select(.tag == \"${tag}\")" "$NODES_META_FILE" 2>/dev/null || echo "")
+            share_link=$(echo "$meta" | jq -r '.share_link // empty' 2>/dev/null || echo "")
+            yaml_config=$(echo "$meta" | jq -r '.yaml_config // empty' 2>/dev/null || echo "")
+        fi
         
         echo ""
         echo "============================================"
@@ -478,7 +483,11 @@ _view_nodes() {
     fi
     
     echo ""
-    _info "元数据文件: ${NODES_META_FILE}"
+    if [ -f "$NODES_META_FILE" ]; then
+        _info "元数据文件: ${NODES_META_FILE}"
+    else
+        _warning "元数据文件不存在（旧版本节点）"
+    fi
 }
 
 _delete_node() {
@@ -506,9 +515,11 @@ _delete_node() {
     local temp=$(mktemp)
     jq "del(.inbounds[${array_index}])" "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
-    # 删除元数据文件中的节点
-    local temp_meta=$(mktemp)
-    jq "del(.nodes[] | select(.tag == \"${tag}\"))" "$NODES_META_FILE" > "$temp_meta" && mv "$temp_meta" "$NODES_META_FILE"
+    # 删除元数据文件中的节点（如果文件存在）
+    if [ -f "$NODES_META_FILE" ]; then
+        local temp_meta=$(mktemp)
+        jq "del(.nodes[] | select(.tag == \"${tag}\"))" "$NODES_META_FILE" > "$temp_meta" && mv "$temp_meta" "$NODES_META_FILE"
+    fi
     
     _success "节点 ${tag} 已删除"
     _restart_service
