@@ -229,10 +229,16 @@ _add_vless_reality() {
     # 生成分享链接
     local share_link="vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#VLESS-REALITY-${port}"
     
+    # 生成 Clash YAML 配置
+    local yaml_config="- {name: VLESS-REALITY-${port}, type: vless, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${sni}, client-fingerprint: chrome, reality-opts: {public-key: ${public_key}, short-id: ${short_id}}}"
+    
+    # 保存到文件
+    echo "$yaml_config" >> "$YAML_NODES_FILE"
+    
     _success "VLESS-REALITY 节点添加成功!"
     echo ""
     _info "分享链接:"
-    echo -e "${YELLOW}${share_link}${NC}"  # ← 这里会输出 URI
+    echo -e "${YELLOW}${share_link}${NC}"
     echo ""
     _info "Clash YAML 配置:"
     echo -e "${GREEN}${yaml_config}${NC}"
@@ -278,10 +284,16 @@ _add_hysteria2() {
     
     local share_link="hysteria2://${password}@${SERVER_IP}:${port}?sni=${sni}&insecure=1#Hysteria2-${port}"
     
+    # 生成 Clash YAML 配置
+    local yaml_config="- {name: Hysteria2-${port}, type: hysteria2, server: ${SERVER_IP}, port: ${port}, password: ${password}, udp: true, skip-cert-verify: true, sni: ${sni}}"
+    
+    # 保存到文件
+    echo "$yaml_config" >> "$YAML_NODES_FILE"
+    
     _success "Hysteria2 节点添加成功!"
     echo ""
     _info "分享链接:"
-    echo -e "${YELLOW}${share_link}${NC}"  # ← 这里会输出 URI
+    echo -e "${YELLOW}${share_link}${NC}"
     echo ""
     _info "Clash YAML 配置:"
     echo -e "${GREEN}${yaml_config}${NC}"
@@ -331,10 +343,16 @@ _add_tuic() {
     
     local share_link="tuic://${uuid}:${password}@${SERVER_IP}:${port}?sni=${sni}&congestion_control=bbr&alpn=h3&allow_insecure=1#TUICv5-${port}"
     
+    # 生成 Clash YAML 配置
+    local yaml_config="- {name: TUICv5-${port}, type: tuic, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, password: ${password}, udp: true, sni: ${sni}, skip-cert-verify: true, congestion-controller: bbr, alpn: [h3]}"
+    
+    # 保存到文件
+    echo "$yaml_config" >> "$YAML_NODES_FILE"
+    
     _success "TUICv5 节点添加成功!"
     echo ""
     _info "分享链接:"
-    echo -e "${YELLOW}${share_link}${NC}"  # ← 这里会输出 URI
+    echo -e "${YELLOW}${share_link}${NC}"
     echo ""
     _info "Clash YAML 配置:"
     echo -e "${GREEN}${yaml_config}${NC}"
@@ -364,10 +382,16 @@ _add_shadowsocks2022() {
     
     local share_link="ss://$(echo -n "2022-blake3-aes-128-gcm:${password}" | base64 -w0)@${SERVER_IP}:${port}#SS2022-${port}"
     
+    # 生成 Clash YAML 配置
+    local yaml_config="- {name: SS2022-${port}, type: ss, server: ${SERVER_IP}, port: ${port}, cipher: 2022-blake3-aes-128-gcm, password: ${password}, udp: true}"
+    
+    # 保存到文件
+    echo "$yaml_config" >> "$YAML_NODES_FILE"
+    
     _success "Shadowsocks-2022 节点添加成功!"
     echo ""
     _info "分享链接:"
-    echo -e "${YELLOW}${share_link}${NC}"  # ← 这里会输出 URI
+    echo -e "${YELLOW}${share_link}${NC}"
     echo ""
     _info "Clash YAML 配置:"
     echo -e "${GREEN}${yaml_config}${NC}"
@@ -378,14 +402,92 @@ _add_shadowsocks2022() {
 _view_nodes() {
     clear
     _info "=== 当前节点列表 ==="
-    jq -r '.inbounds[] | "\(.tag) - 端口: \(.listen_port) - 类型: \(.type)"' "$CONFIG_FILE" 2>/dev/null || _warning "暂无节点"
-    echo ""
-    echo "--------------------------------------------"
-    _info "Clash YAML 配置文件: ${YAML_NODES_FILE}"
-    if [ -f "$YAML_NODES_FILE" ]; then
-        echo ""
-        cat "$YAML_NODES_FILE"  # 这里会输出整个 YAML 文件内容
+    
+    # 获取公网 IP（如果还没有）
+    if [ -z "$SERVER_IP" ]; then
+        _get_public_ip
     fi
+    
+    local count=0
+    
+    # 遍历所有 inbound
+    while IFS= read -r inbound; do
+        local type=$(echo "$inbound" | jq -r '.type')
+        local tag=$(echo "$inbound" | jq -r '.tag')
+        local port=$(echo "$inbound" | jq -r '.listen_port')
+        
+        echo ""
+        echo "============================================"
+        _info "节点: ${tag}"
+        echo "类型: ${type}"
+        echo "端口: ${port}"
+        echo ""
+        
+        case $type in
+            vless)
+                local uuid=$(echo "$inbound" | jq -r '.users[0].uuid')
+                local sni=$(echo "$inbound" | jq -r '.tls.server_name')
+                local short_id=$(echo "$inbound" | jq -r '.tls.reality.short_id[0]')
+                
+                _warning "⚠️  VLESS-REALITY 节点无法从配置重新生成完整信息"
+                _info "原因: public_key 未存储在配置中"
+                _info "建议: 删除后重新添加以获取完整配置"
+                ;;
+            
+            hysteria2)
+                local password=$(echo "$inbound" | jq -r '.users[0].password')
+                local share_link="hysteria2://${password}@${SERVER_IP}:${port}?insecure=1#${tag}"
+                local yaml_config="- {name: ${tag}, type: hysteria2, server: ${SERVER_IP}, port: ${port}, password: ${password}, udp: true, skip-cert-verify: true}"
+                
+                _info "分享链接:"
+                echo -e "${YELLOW}${share_link}${NC}"
+                echo ""
+                _info "Clash YAML:"
+                echo -e "${GREEN}${yaml_config}${NC}"
+                count=$((count + 1))
+                ;;
+            
+            tuic)
+                local uuid=$(echo "$inbound" | jq -r '.users[0].uuid')
+                local password=$(echo "$inbound" | jq -r '.users[0].password')
+                local share_link="tuic://${uuid}:${password}@${SERVER_IP}:${port}?congestion_control=bbr&alpn=h3&allow_insecure=1#${tag}"
+                local yaml_config="- {name: ${tag}, type: tuic, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, password: ${password}, udp: true, skip-cert-verify: true, congestion-controller: bbr, alpn: [h3]}"
+                
+                _info "分享链接:"
+                echo -e "${YELLOW}${share_link}${NC}"
+                echo ""
+                _info "Clash YAML:"
+                echo -e "${GREEN}${yaml_config}${NC}"
+                count=$((count + 1))
+                ;;
+            
+            shadowsocks)
+                local password=$(echo "$inbound" | jq -r '.password')
+                local method=$(echo "$inbound" | jq -r '.method')
+                local share_link="ss://$(echo -n "${method}:${password}" | base64 -w0)@${SERVER_IP}:${port}#${tag}"
+                local yaml_config="- {name: ${tag}, type: ss, server: ${SERVER_IP}, port: ${port}, cipher: ${method}, password: ${password}, udp: true}"
+                
+                _info "分享链接:"
+                echo -e "${YELLOW}${share_link}${NC}"
+                echo ""
+                _info "Clash YAML:"
+                echo -e "${GREEN}${yaml_config}${NC}"
+                count=$((count + 1))
+                ;;
+        esac
+        
+    done < <(jq -c '.inbounds[]' "$CONFIG_FILE" 2>/dev/null)
+    
+    echo ""
+    echo "============================================"
+    if [ $count -eq 0 ]; then
+        _warning "暂无可用节点"
+    else
+        _success "共 $count 个节点"
+    fi
+    
+    echo ""
+    _info "YAML 配置文件: ${YAML_NODES_FILE}"
 }
 
 _delete_node() {
@@ -530,10 +632,10 @@ _main_menu() {
         echo " 7) 重启服务"
         echo " 8) 查看运行状态"
         echo "--------------------------------------------"
-        echo " 9) 完全卸载 sing-box"
-        echo " 0) 退出"
+        echo " 0) 完全卸载 sing-box"
+        echo " q) 退出"
         echo "============================================"
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-8/q]: " choice
         
         case $choice in
             1) _add_vless_reality; _restart_service ;;
@@ -544,8 +646,8 @@ _main_menu() {
             6) _delete_node ;;
             7) _restart_service ;;
             8) _view_status ;;
-            9) _uninstall ;;
-            0) exit 0 ;;
+            0) _uninstall ;;
+            q|Q) exit 0 ;;
             *) _warning "无效选项" ;;
         esac
         echo ""
