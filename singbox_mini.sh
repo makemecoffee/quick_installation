@@ -6,8 +6,6 @@
 # 支持系统: Debian, Ubuntu, Alpine
 # ==============================================
 
-# 移除 set -e，改为手动错误处理
-
 # --- 颜色定义 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,10 +18,10 @@ SINGBOX_BIN="/usr/local/bin/sing-box"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 CONFIG_FILE="${SINGBOX_DIR}/config.json"
 YAML_NODES_FILE="${SINGBOX_DIR}/clash_nodes.yaml"
-NODES_META_FILE="${SINGBOX_DIR}/nodes_meta.json"  # 新增：存储节点元数据
+NODES_META_FILE="${SINGBOX_DIR}/nodes_meta.json" 
 SERVICE_FILE="/etc/systemd/system/sing-box.service"
 SCRIPT_VERSION="1.0"
-SCRIPT_PATH="/usr/local/bin/sbm"  # 修改：从 sbl 改为 sbm
+SCRIPT_PATH="/usr/local/bin/sbm" 
 
 # --- 全局变量 ---
 SERVER_IP=""
