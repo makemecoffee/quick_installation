@@ -403,23 +403,13 @@ _delete_node() {
 }
 
 _create_global_command() {
-    _info "正在创建全局命令 'sbl'..."
-    
-    # 获取当前脚本的绝对路径
-    local current_script="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null)"
-    
-    # 如果当前脚本已经是 /usr/local/bin/sbl,则跳过
-    if [ "$current_script" = "$SCRIPT_PATH" ]; then
-        _info "全局命令已存在"
-        return
+    # 直接复制当前脚本内容到目标位置,避免路径检测问题
+    if [ ! -f "$SCRIPT_PATH" ] || ! diff -q "$0" "$SCRIPT_PATH" &>/dev/null; then
+        _info "正在创建/更新全局命令 'sbl'..."
+        cp -f "$0" "$SCRIPT_PATH"
+        chmod +x "$SCRIPT_PATH"
+        _success "全局命令已创建！现在可以使用 'sbl' 命令"
     fi
-    
-    # 复制脚本到目标位置
-    cp "$current_script" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    
-    _success "全局命令已创建！"
-    _info "现在你可以在任何位置输入 'sbl' 来打开管理菜单"
 }
 
 _uninstall() {
@@ -554,7 +544,9 @@ main() {
     
     # 检查是否已安装 sing-box
     if [ -f "$SINGBOX_BIN" ] && [ -f "$CONFIG_FILE" ]; then
-        # 已安装,获取 IP 后直接进入菜单
+        # 已安装,更新全局命令(确保是最新版本)
+        _create_global_command
+        # 获取 IP 后直接进入菜单
         _get_public_ip
         _main_menu
     else
