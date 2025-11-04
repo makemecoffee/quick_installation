@@ -546,22 +546,31 @@ main() {
     _check_root
     _detect_os
     _get_public_ip
-    _install_dependencies
-    _install_singbox
-    _init_config
-    _create_service
     
-    # 创建全局命令（每次运行都检查并创建,确保是最新版本）
-    _create_global_command
-    
-    # 启动服务（兼容 Alpine 和 Debian/Ubuntu）
-    if [ "$OS_TYPE" = "alpine" ]; then
-        rc-service sing-box start 2>/dev/null || true
+    # 检查是否已安装 sing-box
+    if [ -f "$SINGBOX_BIN" ] && [ -f "$CONFIG_FILE" ]; then
+        # 已安装,直接进入菜单
+        _info "sing-box 已安装"
+        _main_menu
     else
-        systemctl start sing-box 2>/dev/null || true
+        # 未安装,执行完整安装流程
+        _install_dependencies
+        _install_singbox
+        _init_config
+        _create_service
+        
+        # 创建全局命令
+        _create_global_command
+        
+        # 启动服务
+        if [ "$OS_TYPE" = "alpine" ]; then
+            rc-service sing-box start 2>/dev/null || true
+        else
+            systemctl start sing-box 2>/dev/null || true
+        fi
+        
+        _main_menu
     fi
-    
-    _main_menu
 }
 
 main
