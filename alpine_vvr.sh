@@ -147,7 +147,7 @@ uninstall_xray() {
   fi
 
   green "Xray 卸载完成"
-  echo "提示：如无其他用途，可执行：apk del curl xz jq bash openssl xxd"
+  echo "提示：如无其他用途，可卸载依赖：apk del curl xz jq bash openssl xxd"
 }
 
 
