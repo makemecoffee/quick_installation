@@ -65,14 +65,45 @@ _get_public_ip() {
 }
 
 _install_dependencies() {
-    _info "安装依赖..."
+    _info "检查依赖..."
+    
     if [ "$OS_TYPE" = "alpine" ]; then
+        # 检查 Alpine 依赖
+        local missing_deps=()
+        for pkg in curl jq openssl wget tar; do
+            if ! apk info -e "$pkg" &>/dev/null; then
+                missing_deps+=("$pkg")
+            fi
+        done
+        
+        if [ ${#missing_deps[@]} -eq 0 ]; then
+            _success "所有依赖已安装"
+            return
+        fi
+        
+        _info "需要安装: ${missing_deps[*]}"
         apk update
-        apk add --no-cache curl jq openssl wget tar
+        apk add --no-cache "${missing_deps[@]}"
     else
+        # 检查 Debian/Ubuntu 依赖
+        local missing_deps=()
+        for pkg in curl jq openssl wget; do
+            if ! dpkg -l | grep -qw "^ii.*$pkg"; then
+                missing_deps+=("$pkg")
+            fi
+        done
+        
+        if [ ${#missing_deps[@]} -eq 0 ]; then
+            _success "所有依赖已安装"
+            return
+        fi
+        
+        _info "需要安装: ${missing_deps[*]}"
         apt-get update
-        apt-get install -y curl jq openssl wget
+        apt-get install -y "${missing_deps[@]}"
     fi
+    
+    _success "依赖安装完成"
 }
 
 _install_singbox() {
