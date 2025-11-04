@@ -716,6 +716,17 @@ _main_menu() {
         clear
         echo "============================================"
         _info "  sing-box 轻量化管理脚本 v${SCRIPT_VERSION}"
+        
+        # 显示 sing-box 版本信息或未安装状态
+        if [ -f "$SINGBOX_BIN" ]; then
+            local sb_version=$(${SINGBOX_BIN} version 2>/dev/null | head -n1 | awk '{print $3}')
+            if [ -n "$sb_version" ]; then
+                echo -e "  ${GREEN}sing-box ${sb_version}${NC}"
+            fi
+        else
+            echo -e "  ${YELLOW}sing-box 未安装${NC}"
+        fi
+        
         echo "============================================"
         echo " 1) 添加 VLESS-REALITY 节点"
         echo " 2) 添加 Hysteria2 节点"
