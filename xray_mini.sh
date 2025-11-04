@@ -166,24 +166,39 @@ EOF
     # systemd 配置（Debian/Ubuntu）
     if [ -f "$SERVICE_FILE" ]; then
         _success "systemd 服务文件已存在"
+        # 确保配置文件权限正确
+        chmod 644 "$CONFIG_FILE"
+        [ -f "$NODES_META_FILE" ] && chmod 644 "$NODES_META_FILE"
+        [ -f "$YAML_NODES_FILE" ] && chmod 644 "$YAML_NODES_FILE"
         return
     fi
     
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Xray service
-After=network.target
+Documentation=https://github.com/xtls/xray-core
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 ExecStart=${XRAY_BIN} run -c ${CONFIG_FILE}
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
+LimitNOFILE=infinity
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # 确保配置文件权限正确
+    chmod 644 "$CONFIG_FILE"
+    [ -f "$NODES_META_FILE" ] && chmod 644 "$NODES_META_FILE"
+    [ -f "$YAML_NODES_FILE" ] && chmod 644 "$YAML_NODES_FILE"
+    
     systemctl daemon-reload
     systemctl enable xray
     _success "systemd 服务已创建"
@@ -220,6 +235,12 @@ EOF
     if [ ! -f "$NODES_META_FILE" ]; then
         echo '{"nodes":[]}' > "$NODES_META_FILE"
     fi
+    
+    # 设置正确的权限
+    chmod 755 "$XRAY_DIR"
+    chmod 644 "$CONFIG_FILE"
+    [ -f "$YAML_NODES_FILE" ] && chmod 644 "$YAML_NODES_FILE"
+    [ -f "$NODES_META_FILE" ] && chmod 644 "$NODES_META_FILE"
 }
 
 # 保存节点元数据
@@ -269,8 +290,8 @@ _add_vless_reality() {
     
     # 生成密钥对
     local keys=$($XRAY_BIN x25519)
-    local priv_key=$(echo "$keys" | awk '/Private key:/ {print $3}')
-    local pub_key=$(echo "$keys" | awk '/Public key:/ {print $3}')
+    local priv_key=$(echo "$keys" | grep "Private key" | awk '{print $3}')
+    local pub_key=$(echo "$keys" | grep "Public key" | awk '{print $3}')
     
     # 添加 inbound
     local temp=$(mktemp)
