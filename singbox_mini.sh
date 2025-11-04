@@ -254,7 +254,13 @@ _add_vless_reality() {
     read -p "伪装域名 (默认: www.microsoft.com): " sni
     sni=${sni:-www.microsoft.com}
     
-    local uuid=$(${SINGBOX_BIN} generate uuid)
+    # UUID 可选手动输入
+    read -p "UUID (回车自动生成): " uuid
+    if [ -z "$uuid" ]; then
+        uuid=$(${SINGBOX_BIN} generate uuid)
+        _info "已自动生成 UUID: ${uuid}"
+    fi
+    
     local keypair=$(${SINGBOX_BIN} generate reality-keypair)
     local private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
     local public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
@@ -316,8 +322,12 @@ _add_hysteria2() {
     
     local tag="${custom_tag:-hy2-${port}}"
     
-    read -p "密码 (回车随机生成): " password
-    password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
+    # 密码可选手动输入
+    read -p "密码 (回车自动生成): " password
+    if [ -z "$password" ]; then
+        password=$(${SINGBOX_BIN} generate rand --hex 16)
+        _info "已自动生成密码: ${password}"
+    fi
     
     read -p "伪装域名 (默认: bing.com): " sni
     sni=${sni:-bing.com}
@@ -372,8 +382,19 @@ _add_tuic() {
     
     local tag="${custom_tag:-tuic-${port}}"
     
-    local uuid=$(${SINGBOX_BIN} generate uuid)
-    local password=$(${SINGBOX_BIN} generate rand --hex 16)
+    # UUID 可选手动输入
+    read -p "UUID (回车自动生成): " uuid
+    if [ -z "$uuid" ]; then
+        uuid=$(${SINGBOX_BIN} generate uuid)
+        _info "已自动生成 UUID: ${uuid}"
+    fi
+    
+    # 密码可选手动输入
+    read -p "密码 (回车自动生成): " password
+    if [ -z "$password" ]; then
+        password=$(${SINGBOX_BIN} generate rand --hex 16)
+        _info "已自动生成密码: ${password}"
+    fi
     
     read -p "伪装域名 (默认: bing.com): " sni
     sni=${sni:-bing.com}
@@ -432,7 +453,12 @@ _add_shadowsocks2022() {
     
     local tag="${custom_tag:-ss2022-${port}}"
     
-    local password=$(${SINGBOX_BIN} generate rand --base64 16)
+    # 密码可选手动输入
+    read -p "密码 (回车自动生成): " password
+    if [ -z "$password" ]; then
+        password=$(${SINGBOX_BIN} generate rand --base64 16)
+        _info "已自动生成密码: ${password}"
+    fi
     
     # 添加 inbound
     local temp=$(mktemp)
