@@ -696,58 +696,160 @@ _restart_service() {
 }
 
 _view_status() {
+    clear
+    _info "=== Xray 运行状态 ==="
+    echo ""
+    
     if [ "$OS_TYPE" = "alpine" ]; then
         rc-service xray status
     else
         systemctl status xray --no-pager -l
     fi
+    
+    echo ""
+    echo "============================================"
+    _info "最近的错误日志:"
+    echo "============================================"
+    
+    if [ "$OS_TYPE" = "alpine" ]; then
+        if [ -f /var/log/xray.err ]; then
+            tail -n 20 /var/log/xray.err
+        else
+            _warning "无错误日志"
+        fi
+    else
+        journalctl -u xray --no-pager -n 20 --priority=err
+    fi
 }
 
-_enable_bbr() {
+_view_logs() {
     clear
-    _info "=== 启用 BBR 加速 ==="
+    _info "=== Xray 实时日志 ==="
+    _warning "按 Ctrl+C 退出日志查看"
+    echo ""
+    sleep 2
     
-    # 检查当前 TCP 拥塞控制算法
-    local current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-    
-    if [ "$current" = "bbr" ]; then
-        _success "BBR 已经启用，无需重复配置"
-        return
-    fi
-    
-    _info "当前拥塞控制算法: ${current:-未知}"
-    
-    # 检查内核是否支持 BBR
-    if ! modprobe tcp_bbr 2>/dev/null; then
-        _warning "警告: 内核可能不支持 BBR"
-    fi
-    
-    # 配置 BBR
     if [ "$OS_TYPE" = "alpine" ]; then
-        # Alpine 使用 /etc/sysctl.d/
-        cat > /etc/sysctl.d/99-bbr.conf << EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-        sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null
+        tail -f /var/log/xray.log
     else
-        # Debian/Ubuntu
-        sed -i '/^net.core.default_qdisc/d' /etc/sysctl.conf
-        sed -i '/^net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-        
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        
-        sysctl -p >/dev/null
+        journalctl -u xray -f --no-pager
+    fi
+}
+
+_test_config() {
+    clear
+    _info "=== 测试配置文件 ==="
+    echo ""
+    
+    if [ ! -f "$CONFIG_FILE" ]; then
+        _error "配置文件不存在: $CONFIG_FILE"
     fi
     
-    # 验证 BBR 是否启用
-    local new_current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-    
-    if [ "$new_current" = "bbr" ]; then
-        _success "BBR 已成功启用"
+    _info "1. 检查 JSON 格式..."
+    if jq empty "$CONFIG_FILE" 2>/dev/null; then
+        _success "✓ JSON 格式正确"
     else
-        _warning "BBR 配置完成，但可能需要重启系统生效"
+        _error "✗ JSON 格式错误，请检查配置文件"
+    fi
+    
+    echo ""
+    _info "2. 检查文件权限..."
+    local perm=$(stat -c "%a" "$CONFIG_FILE" 2>/dev/null || stat -f "%A" "$CONFIG_FILE" 2>/dev/null)
+    if [ "$perm" = "644" ]; then
+        _success "✓ 文件权限正确 ($perm)"
+    else
+        _warning "⚠ 文件权限: $perm (建议: 644)"
+        _fix_permissions
+    fi
+    
+    echo ""
+    _info "3. 使用 Xray 验证配置..."
+    if $XRAY_BIN run -test -c "$CONFIG_FILE" 2>&1 | grep -q "Configuration OK"; then
+        _success "✓ 配置文件验证通过"
+    else
+        _warning "配置验证输出:"
+        $XRAY_BIN run -test -c "$CONFIG_FILE" 2>&1
+    fi
+    
+    echo ""
+    _info "4. 检查端口占用..."
+    local ports=$(jq -r '.inbounds[].port' "$CONFIG_FILE" 2>/dev/null)
+    for port in $ports; do
+        if command -v netstat >/dev/null 2>&1; then
+            if netstat -tuln | grep -q ":${port} "; then
+                _warning "⚠ 端口 $port 可能已被占用"
+            else
+                _success "✓ 端口 $port 可用"
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -tuln | grep -q ":${port} "; then
+                _warning "⚠ 端口 $port 可能已被占用"
+            else
+                _success "✓ 端口 $port 可用"
+            fi
+        fi
+    done
+    
+    echo ""
+    _info "5. 检查节点数量..."
+    local node_count=$(jq '.inbounds | length' "$CONFIG_FILE")
+    _success "✓ 当前配置了 $node_count 个节点"
+}
+
+_check_firewall() {
+    clear
+    _info "=== 防火墙检查 ==="
+    echo ""
+    
+    local ports=$(jq -r '.inbounds[].port' "$CONFIG_FILE" 2>/dev/null)
+    
+    if command -v ufw >/dev/null 2>&1; then
+        _info "检测到 UFW 防火墙"
+        for port in $ports; do
+            if ufw status | grep -q "${port}/tcp.*ALLOW"; then
+                _success "✓ 端口 $port 已开放"
+            else
+                _warning "✗ 端口 $port 未开放"
+                read -p "是否开放端口 $port? (y/n): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    ufw allow $port/tcp
+                    _success "端口 $port 已开放"
+                fi
+            fi
+        done
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+        _info "检测到 firewalld 防火墙"
+        for port in $ports; do
+            if firewall-cmd --list-ports | grep -q "${port}/tcp"; then
+                _success "✓ 端口 $port 已开放"
+            else
+                _warning "✗ 端口 $port 未开放"
+                read -p "是否开放端口 $port? (y/n): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    firewall-cmd --permanent --add-port=${port}/tcp
+                    firewall-cmd --reload
+                    _success "端口 $port 已开放"
+                fi
+            fi
+        done
+    elif command -v iptables >/dev/null 2>&1; then
+        _info "检测到 iptables 防火墙"
+        for port in $ports; do
+            if iptables -L -n | grep -q "dpt:${port}"; then
+                _success "✓ 端口 $port 已开放"
+            else
+                _warning "✗ 端口 $port 未开放"
+                read -p "是否开放端口 $port? (y/n): " confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    iptables -I INPUT -p tcp --dport $port -j ACCEPT
+                    _success "端口 $port 已开放"
+                    _warning "注意: iptables 规则可能在重启后失效，建议使用 iptables-save"
+                fi
+            fi
+        done
+    else
+        _warning "未检测到常见防火墙，请手动检查端口开放情况"
+        echo "需要开放的端口: $ports"
     fi
 }
 
@@ -776,12 +878,16 @@ _main_menu() {
         echo " 5) 重启服务"
         echo " 6) 查看运行状态"
         echo " 7) 启用 BBR 加速"
+        echo "--------------------------------------------"
         echo " 9) 修复文件权限"
+        echo " t) 测试配置文件"
+        echo " l) 查看实时日志"
+        echo " f) 检查防火墙"
         echo "--------------------------------------------"
         echo " 8) 完全卸载 Xray"
         echo " 0) 退出"
         echo "============================================"
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择: " choice
         
         case $choice in
             1) _add_vless_reality; _restart_service ;;
@@ -793,6 +899,9 @@ _main_menu() {
             7) _enable_bbr ;;
             8) _uninstall ;;
             9) _fix_permissions; _restart_service ;;
+            t|T) _test_config ;;
+            l|L) _view_logs ;;
+            f|F) _check_firewall ;;
             0) exit 0 ;;
             *) _warning "无效选项" ;;
         esac
