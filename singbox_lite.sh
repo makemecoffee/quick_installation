@@ -403,12 +403,28 @@ _delete_node() {
 }
 
 _create_global_command() {
-    # 直接复制当前脚本内容到目标位置,避免路径检测问题
-    if [ ! -f "$SCRIPT_PATH" ] || ! diff -q "$0" "$SCRIPT_PATH" &>/dev/null; then
-        _info "正在创建/更新全局命令 'sbl'..."
-        cp -f "$0" "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
-        _success "全局命令已创建！现在可以使用 'sbl' 命令"
+    _info "正在创建全局命令 'sbl'..."
+    
+    # 检查当前脚本是否是通过管道执行（如 bash <(curl ...)）
+    if [[ "$0" =~ ^/dev/fd/ ]] || [[ "$0" == "bash" ]] || [[ ! -f "$0" ]]; then
+        # 通过管道执行，需要重新下载脚本
+        local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/singbox_lite.sh"
+        _info "检测到通过管道执行，正在下载脚本..."
+        
+        if curl -fsSL "$script_url" -o "$SCRIPT_PATH" 2>/dev/null; then
+            chmod +x "$SCRIPT_PATH"
+            _success "全局命令已创建！现在可以使用 'sbl' 命令"
+        else
+            _warning "警告: 下载脚本失败，无法创建全局命令"
+            _info "你可以手动运行: curl -fsSL $script_url -o $SCRIPT_PATH && chmod +x $SCRIPT_PATH"
+        fi
+    else
+        # 直接执行脚本文件
+        if [ ! -f "$SCRIPT_PATH" ] || ! diff -q "$0" "$SCRIPT_PATH" &>/dev/null; then
+            cp -f "$0" "$SCRIPT_PATH"
+            chmod +x "$SCRIPT_PATH"
+            _success "全局命令已创建！现在可以使用 'sbl' 命令"
+        fi
     fi
 }
 
