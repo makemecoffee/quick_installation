@@ -194,7 +194,7 @@ _init_config() {
         cat > "$CONFIG_FILE" << 'EOF'
 {
   "log": {
-    "level": "info"
+    "disabled": true
   },
   "inbounds": [],
   "outbounds": [
