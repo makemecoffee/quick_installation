@@ -6,7 +6,7 @@
 # 支持系统: Debian, Ubuntu, Alpine
 # ==============================================
 
-set -e
+# 移除 set -e，改为手动错误处理
 
 # --- 颜色定义 ---
 RED='\033[0;31m'
@@ -51,9 +51,15 @@ _detect_os() {
 
 _get_public_ip() {
     _info "正在获取公网 IP..."
-    SERVER_IP=$(curl -s4 --max-time 3 ip.sb || curl -s4 --max-time 3 ifconfig.me)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s6 --max-time 3 ip.sb || curl -s6 --max-time 3 ifconfig.me)
-    [ -z "$SERVER_IP" ] && _error "无法获取公网 IP"
+    SERVER_IP=$(curl -s4 --max-time 3 ip.sb 2>/dev/null || curl -s4 --max-time 3 ifconfig.me 2>/dev/null || true)
+    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s6 --max-time 3 ip.sb 2>/dev/null || curl -s6 --max-time 3 ifconfig.me 2>/dev/null || true)
+    
+    if [ -z "$SERVER_IP" ]; then
+        _warning "警告: 无法自动获取公网 IP"
+        read -p "请手动输入服务器公网 IP: " SERVER_IP
+        [ -z "$SERVER_IP" ] && _error "IP 地址不能为空"
+    fi
+    
     _success "公网 IP: ${SERVER_IP}"
 }
 
@@ -550,7 +556,6 @@ main() {
     if [ -f "$SINGBOX_BIN" ] && [ -f "$CONFIG_FILE" ]; then
         # 已安装,获取 IP 后直接进入菜单
         _get_public_ip
-        _info "sing-box 已安装"
         _main_menu
     else
         # 未安装,执行完整安装流程
