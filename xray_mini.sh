@@ -240,9 +240,11 @@ _add_vless_reality() {
     local public_key=$(echo "$keys" | awk '/Public key:/ {print $3}')
     local short_id=$(openssl rand -hex 8)
     
+    # 修复：使用正确的 Xray 配置格式
     local temp=$(mktemp)
     jq ".inbounds += [{
         \"tag\": \"${tag}\",
+        \"listen\": \"0.0.0.0\",
         \"port\": ${port},
         \"protocol\": \"vless\",
         \"settings\": {
@@ -256,6 +258,7 @@ _add_vless_reality() {
             \"network\": \"tcp\",
             \"security\": \"reality\",
             \"realitySettings\": {
+                \"show\": false,
                 \"dest\": \"${dest}:443\",
                 \"serverNames\": [\"${sni}\"],
                 \"privateKey\": \"${private_key}\",
@@ -286,15 +289,16 @@ _add_shadowsocks2022() {
     local tag="${custom_tag:-ss2022-${port}}"
     local password=$(openssl rand -base64 16)
     
+    # 修复：使用正确的 Xray Shadowsocks-2022 配置格式
     local temp=$(mktemp)
     jq ".inbounds += [{
         \"tag\": \"${tag}\",
+        \"listen\": \"0.0.0.0\",
         \"port\": ${port},
         \"protocol\": \"shadowsocks\",
         \"settings\": {
             \"method\": \"2022-blake3-aes-128-gcm\",
-            \"password\": \"${password}\",
-            \"network\": \"tcp,udp\"
+            \"password\": \"${password}\"
         }
     }]" "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
