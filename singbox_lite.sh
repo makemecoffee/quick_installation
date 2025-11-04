@@ -697,10 +697,10 @@ _main_menu() {
         echo " 7) 重启服务"
         echo " 8) 查看运行状态"
         echo "--------------------------------------------"
-        echo " 0) 完全卸载 sing-box"
-        echo " q) 退出"
+        echo " 9) 完全卸载 sing-box"
+        echo " 0) 退出"
         echo "============================================"
-        read -p "请选择 [0-8/q]: " choice
+        read -p "请选择 [0-9]: " choice
         
         case $choice in
             1) _add_vless_reality; _restart_service ;;
@@ -711,8 +711,8 @@ _main_menu() {
             6) _delete_node ;;
             7) _restart_service ;;
             8) _view_status ;;
-            0) _uninstall ;;
-            q|Q) exit 0 ;;
+            9) _uninstall ;;
+            0) exit 0 ;;
             *) _warning "无效选项" ;;
         esac
         echo ""
