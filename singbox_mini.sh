@@ -575,7 +575,7 @@ _create_global_command() {
     # 检查当前脚本是否是通过管道执行（如 bash <(curl ...)）
     if [[ "$0" =~ ^/dev/fd/ ]] || [[ "$0" == "bash" ]] || [[ ! -f "$0" ]]; then
         # 通过管道执行，需要重新下载脚本
-        local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/singbox_lite.sh"
+        local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/singbox_mini.sh"
         _info "检测到通过管道执行，正在下载脚本..."
         
         if curl -fsSL "$script_url" -o "$SCRIPT_PATH" 2>/dev/null; then
@@ -603,9 +603,8 @@ _uninstall() {
     _warning "即将删除以下内容："
     echo "  • sing-box 程序: ${SINGBOX_BIN}"
     echo "  • 配置目录: ${SINGBOX_DIR}"
-    echo "  • 所有配置文件和证书"
-    echo "  • Clash YAML 配置: ${YAML_NODES_FILE}"
-    echo "  • 全局命令: ${SCRIPT_PATH}"  # 添加这一行
+    echo "  • 所有节点配置和证书"
+    echo "  • 全局命令: ${SCRIPT_PATH}"
     if [ "$OS_TYPE" = "alpine" ]; then
         echo "  • OpenRC 服务: /etc/init.d/sing-box"
         echo "  • 日志文件: /var/log/sing-box.*"
