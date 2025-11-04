@@ -497,24 +497,63 @@ _view_nodes() {
 
 _delete_node() {
     clear
-    _view_nodes
-    echo ""
-    read -p "输入要删除的节点序号 (例如: 1): " index
-    [ -z "$index" ] && return
+    _info "=== 删除节点 ==="
     
-    if ! [[ "$index" =~ ^[0-9]+$ ]]; then
-        _error "无效的序号"
+    local index=1
+    
+    # 简化显示，只显示关键信息
+    echo ""
+    while IFS= read -r inbound; do
+        local tag=$(echo "$inbound" | jq -r '.tag')
+        local type=$(echo "$inbound" | jq -r '.type')
+        local port=$(echo "$inbound" | jq -r '.listen_port')
+        
+        echo "  [${index}] ${tag} - ${type} - 端口:${port}"
+        index=$((index + 1))
+    done < <(jq -c '.inbounds[]' "$CONFIG_FILE" 2>/dev/null)
+    
+    echo ""
+    
+    if [ $index -eq 1 ]; then
+        _warning "暂无节点"
+        return
+    fi
+    
+    read -p "输入要删除的节点序号 (按回车取消): " input_index
+    
+    # 如果用户直接回车，取消删除
+    if [ -z "$input_index" ]; then
+        _info "已取消删除"
+        return
+    fi
+    
+    # 验证输入是否为数字
+    if ! [[ "$input_index" =~ ^[0-9]+$ ]]; then
+        _warning "无效的序号，已取消删除"
+        return
     fi
     
     local total=$(jq '.inbounds | length' "$CONFIG_FILE")
     
-    if [ "$index" -lt 1 ] || [ "$index" -gt "$total" ]; then
-        _error "序号超出范围 (1-${total})"
+    # 验证序号是否在有效范围内
+    if [ "$input_index" -lt 1 ] || [ "$input_index" -gt "$total" ]; then
+        _warning "序号超出范围 (1-${total})，已取消删除"
+        return
     fi
     
-    # 获取要删除的节点 tag
-    local array_index=$((index - 1))
+    # 获取要删除的节点信息
+    local array_index=$((input_index - 1))
     local tag=$(jq -r ".inbounds[${array_index}].tag" "$CONFIG_FILE")
+    
+    # 二次确认
+    echo ""
+    _warning "确定要删除节点 [${tag}] 吗？"
+    read -p "输入 y 确认删除，其他键取消: " confirm
+    
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        _info "已取消删除"
+        return
+    fi
     
     # 删除 sing-box 配置中的节点
     local temp=$(mktemp)
