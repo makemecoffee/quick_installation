@@ -545,15 +545,16 @@ _main_menu() {
 main() {
     _check_root
     _detect_os
-    _get_public_ip
     
     # 检查是否已安装 sing-box
     if [ -f "$SINGBOX_BIN" ] && [ -f "$CONFIG_FILE" ]; then
-        # 已安装,直接进入菜单
+        # 已安装,获取 IP 后直接进入菜单
+        _get_public_ip
         _info "sing-box 已安装"
         _main_menu
     else
         # 未安装,执行完整安装流程
+        _get_public_ip
         _install_dependencies
         _install_singbox
         _init_config
