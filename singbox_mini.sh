@@ -186,9 +186,6 @@ pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.err"
 
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn --respawn-delay 5"
-
 depend() {
     need net
     after firewall
