@@ -1,5 +1,7 @@
 # quick_installation
 
+Chinese translation: [README.zh-CN.md](README.zh-CN.md)
+
 ##  Prerequisites
 
 Ensure your system has `bash` and `curl` installed:
@@ -70,12 +72,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 
 #### VLESS-VISION-REALITY (Xray)
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_vvr.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/single_protocol/debian_vvr.sh)
 ```
 
 #### Hysteria2 (Hysteria)
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/debian_hy2.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/single_protocol/debian_hy2.sh)
 ```
 
 ---
@@ -84,7 +86,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 
 #### VLESS-VISION-REALITY (Xray)
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_vvr.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/single_protocol/alpine_vvr.sh)
 ```
 
 **View configuration:**
@@ -94,7 +96,7 @@ cat /usr/local/etc/xray/sublink.txt
 
 #### Hysteria2 (Hysteria)
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/alpine_hy2.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/single_protocol/alpine_hy2.sh)
 ```
 
 **View configuration:**
