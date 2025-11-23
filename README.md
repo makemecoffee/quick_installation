@@ -1,6 +1,6 @@
 # quick_installation
 
-Chinese : [README.md](README_zh.md)
+Chinese : [README](README_zh.md)
 
 ##  Prerequisites
 

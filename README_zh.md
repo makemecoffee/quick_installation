@@ -1,6 +1,6 @@
 # quick_installation（中文）
 
-English: [README.md](README.md)
+English: [README](README.md)
 
 ## 前提条件
 
