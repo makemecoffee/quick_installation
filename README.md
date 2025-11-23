@@ -62,7 +62,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/daemon_sb.sh) remove
 ```
 
-> The daemon script automatically checks sing-box status every minute and restarts it if crashed. Supports both Alpine and Debian/Ubuntu systems.
+> The daemon script automatically checks sing-box status every minute and restarts it if crashed. Supports only Alpine  systems.
 
 ---
 

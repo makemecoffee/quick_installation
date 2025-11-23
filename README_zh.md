@@ -62,7 +62,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/daemon_sb.sh) remove
 ```
 
-> 该守护脚本会每分钟检查 sing-box 状态并在崩溃时重启，支持 Alpine 与 Debian/Ubuntu 系统。
+> 该守护脚本会每分钟检查 sing-box 状态并在崩溃时重启，目前只支持 Alpine  系统。
 
 ---
 

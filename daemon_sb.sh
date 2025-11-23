@@ -13,6 +13,7 @@ install_daemon() {
     elif [ -f /etc/debian_version ]; then
         SYSTEM="debian"
         echo "检测到系统: Debian/Ubuntu"
+        exit 1
     else
         echo "错误: 不支持的系统类型"
         exit 1
