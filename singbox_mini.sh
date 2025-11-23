@@ -172,7 +172,7 @@ _install_singbox() {
 
 _create_service() {
     if [ "$OS_TYPE" = "alpine" ]; then
-        # 为 Alpine 创建 OpenRC 服务文件
+        # Alpine create OpenRC
         local openrc_file="/etc/init.d/sing-box"
         cat > "$openrc_file" << 'EOF'
 #!/sbin/openrc-run
@@ -186,6 +186,9 @@ pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.err"
 
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn --respawn-delay 5"
+
 depend() {
     need net
     after firewall
@@ -197,11 +200,11 @@ start_pre() {
 EOF
         chmod +x "$openrc_file"
         rc-update add sing-box default
-        _success "OpenRC 服务已创建并设置为开机自启"
+        _success "OpenRC 服务已创建"
         return
     fi
 
-    # systemd 配置（Debian/Ubuntu）
+    # create systemd （Debian/Ubuntu）
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=sing-box service
@@ -209,9 +212,11 @@ After=network.target
 
 [Service]
 Type=simple
+User=root
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target

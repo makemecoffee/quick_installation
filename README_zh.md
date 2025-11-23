@@ -50,22 +50,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 sbm
 ```
 
-### 守护脚本（崩溃自动重启）
-
-**安装守护监控：**
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/daemon_sb.sh) install
-```
-
-**移除守护监控：**
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/daemon_sb.sh) remove
-```
-
-> 该守护脚本会每分钟检查 sing-box 状态并在崩溃时重启，目前只支持 Alpine  系统。
-
----
-
 ## 单协议脚本
 
 ### Debian/Ubuntu 系列
