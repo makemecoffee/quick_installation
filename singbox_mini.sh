@@ -179,21 +179,18 @@ _create_service() {
 
 name="sing-box"
 description="sing-box proxy service"
+
 command="/usr/local/bin/sing-box"
 command_args="run -c /usr/local/etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.err"
+
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
 
 depend() {
     need net
     after firewall
 }
 
-start_pre() {
-    checkpath --file --mode 0644 --owner root:root "$output_log" "$error_log"
-}
 EOF
         chmod +x "$openrc_file"
         rc-update add sing-box default
