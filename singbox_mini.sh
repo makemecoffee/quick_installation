@@ -49,18 +49,41 @@ _detect_os() {
 }
 
 _get_public_ip() {
-    _info "正在获取公网 IP..."
-    SERVER_IP=$(curl -s4 --max-time 3 ip.sb 2>/dev/null || curl -s4 --max-time 3 ifconfig.me 2>/dev/null || true)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s6 --max-time 3 ip.sb 2>/dev/null || curl -s6 --max-time 3 ifconfig.me 2>/dev/null || true)
-    
+    echo ""
+    echo "请选择服务器地址来源:"
+    echo "1) 自动获取公网 IP"
+    echo "2) 使用域名 (如 DDNS，不解析，直接使用域名)"
+    read -p "请输入选项 [1/2]: " choice
+
+    if [ "$choice" = "2" ]; then
+        read -p "请输入域名: " DOMAIN
+        [ -z "$DOMAIN" ] && _error "域名不能为空"
+
+        SERVER_IP="$DOMAIN"
+        _success "已选择使用域名: $SERVER_IP"
+        return
+    fi
+
+    # 默认选项 1：自动获取公网 IP
+    _info "正在自动获取公网 IP..."
+
+    SERVER_IP=$(curl -s4 --max-time 3 ip.sb 2>/dev/null \
+        || curl -s4 --max-time 3 ifconfig.me 2>/dev/null \
+        || true)
+
+    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s6 --max-time 3 ip.sb 2>/dev/null \
+        || curl -s6 --max-time 3 ifconfig.me 2>/dev/null \
+        || true)
+
     if [ -z "$SERVER_IP" ]; then
-        _warning "警告: 无法自动获取公网 IP"
+        _warning "无法自动获取公网 IP"
         read -p "请手动输入服务器公网 IP: " SERVER_IP
         [ -z "$SERVER_IP" ] && _error "IP 地址不能为空"
     fi
-    
-    _success "公网 IP: ${SERVER_IP}"
+
+    _success "公网 IP 获取成功: ${SERVER_IP}"
 }
+
 
 # 验证端口号
 _validate_port() {
