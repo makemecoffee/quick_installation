@@ -62,6 +62,20 @@ _get_public_ip() {
     _success "公网 IP: ${SERVER_IP}"
 }
 
+_get_domain() {
+
+    read -p "使用 1)IP , 2)域名  [1/2]: " use_domain
+    if [ "$use_domain" = "2" ]; then
+        read -p "请输入域名: " DOMAIN
+        [ -z "$DOMAIN" ] && _error "域名不能为空"
+
+        SERVER_IP="$DOMAIN"  
+        _success "已切换为使用域名: $SERVER_IP"
+    else
+        _success "继续使用自动获取的 IP: $SERVER_IP"
+    fi
+}
+
 
 # 验证端口号
 _validate_port() {
@@ -306,7 +320,7 @@ _generate_self_signed_cert() {
 _add_vless_reality() {
     clear
     _info "=== 添加 VLESS-REALITY 节点 ==="
-    
+    _get_domain
     read -p "节点名称 (默认: vless-reality-443): " custom_tag
     
     read -p "监听端口 (默认: 443): " port
@@ -395,6 +409,7 @@ _add_vless_reality() {
 _add_hysteria2() {
     clear
     _info "=== 添加 Hysteria2 节点 ==="
+    _get_domain
     
     read -p "节点名称 (默认: hy2-端口): " custom_tag
     
@@ -459,6 +474,7 @@ _add_hysteria2() {
 _add_tuic() {
     clear
     _info "=== 添加 TUICv5 节点 ==="
+    _get_domain
     
     read -p "节点名称 (默认: tuic-端口): " custom_tag
     
@@ -545,6 +561,7 @@ _add_tuic() {
 _add_shadowsocks2022() {
     clear
     _info "=== 添加 Shadowsocks-2022 节点 ==="
+    _get_domain
     
     read -p "节点名称 (默认: ss2022-端口): " custom_tag
     
