@@ -98,36 +98,6 @@ _validate_uuid() {
     fi
 }
 
-# 验证 Shadowsocks-2022 密码格式（必须是有效的 base64）
-_validate_ss2022_password() {
-    local password="$1"
-    
-    # 检查是否为有效的 base64（允许 A-Z a-z 0-9 + / = 字符）
-    if ! [[ "$password" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
-        return 1
-    fi
-    
-    # 尝试解码，检查长度是否为 16 字节
-    local decoded_length
-    if command -v openssl &>/dev/null; then
-        decoded_length=$(echo -n "$password" | openssl base64 -d 2>/dev/null | wc -c)
-    else
-        # 简单的长度估算：base64 编码后长度应该约为 22-24 字符（16字节）
-        local len=${#password}
-        if [ "$len" -lt 20 ] || [ "$len" -gt 28 ]; then
-            return 1
-        fi
-        return 0
-    fi
-    
-    # 检查解码后是否为 16 字节
-    if [ "$decoded_length" -ne 16 ]; then
-        return 1
-    fi
-    
-    return 0
-}
-
 _install_dependencies() {
     _info "检查依赖..."
     
@@ -400,6 +370,36 @@ _add_vless_reality() {
                    "short_id": [$short_id]
                }
            }
+       }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+    
+    # 生成分享链接和 YAML（使用用户自定义的 tag）
+    local share_link="vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp#${tag}"
+    local yaml_config="- {name: ${tag}, type: vless, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${sni}, client-fingerprint: chrome, reality-opts: {public-key: ${public_key}, short-id: ${short_id}}}"
+    
+    _save_node_meta "$tag" "$share_link" "$yaml_config"
+    echo "$yaml_config" >> "$YAML_NODES_FILE"
+    
+    _success "VLESS-REALITY 节点添加成功!"
+    echo ""
+    _info "节点名称: ${tag}"
+    _info "分享链接:"
+    echo -e "${YELLOW}${share_link}${NC}"
+    echo ""
+    _info "Clash YAML 配置:"
+    echo -e "${GREEN}${yaml_config}${NC}"
+    echo ""
+    _info "配置已保存到: ${NODES_META_FILE}"
+}
+
+_add_hysteria2() {
+    clear
+    _info "=== 添加 Hysteria2 节点 ==="
+    _get_domain
+    
+    read -p "节点名称 (默认: hy2-端口): " custom_tag
+    
+    read -p "监听端口: " port
+    [ -z "$port" ] && _error "端口不能为空"
     _validate_port "$port"
     
     local tag="${custom_tag:-hy2-${port}}"
