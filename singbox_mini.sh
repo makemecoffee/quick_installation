@@ -98,21 +98,6 @@ _validate_uuid() {
     fi
 }
 
-# 跨平台 base64 编码（无换行）
-_base64_encode() {
-    if command -v base64 &>/dev/null; then
-        if base64 --help 2>&1 | grep -q -- '-w'; then
-            # GNU base64
-            echo -n "$1" | base64 -w0
-        else
-            # BSD/Alpine base64
-            echo -n "$1" | base64 | tr -d '\n'
-        fi
-    else
-        _error "base64 命令不可用"
-    fi
-}
-
 _install_dependencies() {
     _info "检查依赖..."
     
@@ -592,8 +577,7 @@ _add_shadowsocks2022() {
            "password": $password
        }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
     
-    local encoded_config=$(_base64_encode "2022-blake3-aes-128-gcm:${password}")
-    local share_link="ss://${encoded_config}@${SERVER_IP}:${port}#${tag}"
+    local share_link="ss://2022-blake3-aes-128-gcm:${password}@${SERVER_IP}:${port}#${tag}"
     local yaml_config="- {name: ${tag}, type: ss, server: ${SERVER_IP}, port: ${port}, cipher: 2022-blake3-aes-128-gcm, password: ${password}, udp: true}"
     
     _save_node_meta "$tag" "$share_link" "$yaml_config"
