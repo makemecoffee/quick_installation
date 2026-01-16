@@ -661,12 +661,6 @@ _view_status() {
     else
         systemctl status xray --no-pager -l
     fi
-} {
-  if [ -f /usr/local/etc/xray/sublink.txt ]; then
-    cat /usr/local/etc/xray/sublink.txt
-  else
-    red "未找到节点信息文件"
-  fi
 }
 
 _main_menu() {
