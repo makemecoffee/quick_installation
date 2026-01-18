@@ -730,6 +730,83 @@ _delete_node() {
     _restart_service
 }
 
+_change_outbound() {
+    clear
+    _info "=== 修改出口配置 ==="
+    echo ""
+    echo " 1) 直连 (Freedom)"
+    echo " 2) Shadowsocks-2022 代理"
+    echo " 0) 返回主菜单"
+    echo ""
+    read -p "请选择出口类型 [0-2]: " outbound_choice
+    
+    case $outbound_choice in
+        1)
+            # 直连出口
+            _info "正在配置直连出口..."
+            local temp=$(mktemp)
+            jq '.outbounds = [{
+                "type": "direct",
+                "tag": "direct"
+            }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+            
+            _success "已切换到直连出口"
+            _restart_service
+            ;;
+        2)
+            # SS2022 代理出口
+            _info "配置 Shadowsocks-2022 代理出口"
+            echo ""
+            
+            read -p "上游服务器地址: " ss_server
+            if [ -z "$ss_server" ]; then
+                _warning "服务器地址不能为空，已取消"
+                return
+            fi
+            
+            read -p "上游服务器端口: " ss_port
+            if [ -z "$ss_port" ] || ! [[ "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -lt 1 ] || [ "$ss_port" -gt 65535 ]; then
+                _warning "无效的端口号，已取消"
+                return
+            fi
+            
+            read -p "上游服务器密码: " ss_password
+            if [ -z "$ss_password" ]; then
+                _warning "密码不能为空，已取消"
+                return
+            fi
+            
+            _info "加密方法: 2022-blake3-aes-128-gcm"
+            _info "正在配置 SS2022 出口..."
+            
+            local temp=$(mktemp)
+            jq --arg server "$ss_server" \
+               --argjson port "$ss_port" \
+               --arg password "$ss_password" \
+               '.outbounds = [{
+                   "type": "shadowsocks",
+                   "tag": "proxy",
+                   "server": $server,
+                   "server_port": $port,
+                   "method": "2022-blake3-aes-128-gcm",
+                   "password": $password
+               }]' "$CONFIG_FILE" > "$temp" && mv "$temp" "$CONFIG_FILE"
+            
+            _success "已切换到 SS2022 代理出口"
+            _info "上游服务器: ${ss_server}:${ss_port}"
+            _restart_service
+            ;;
+        0)
+            _info "已取消"
+            return
+            ;;
+        *)
+            _warning "无效的选择"
+            return
+            ;;
+    esac
+}
+
 _create_global_command() {
     _info "正在创建全局命令 'sbm'..."
     
@@ -865,13 +942,14 @@ _main_menu() {
         echo "--------------------------------------------"
         echo " 5) 查看所有节点"
         echo " 6) 删除节点"
-        echo " 7) 重启服务"
-        echo " 8) 查看运行状态"
+        echo " 7) 修改出口"
+        echo " 8) 重启服务"
+        echo " 9) 查看运行状态"
         echo "--------------------------------------------"
-        echo " 9) 完全卸载 sing-box"
+        echo " 10) 完全卸载 sing-box"
         echo " 0) 退出"
         echo "============================================"
-        read -p "请选择 [0-9]: " choice
+        read -p "请选择 [0-10]: " choice
         
         case $choice in
             1) _add_vless_reality; _restart_service ;;
@@ -880,9 +958,10 @@ _main_menu() {
             4) _add_shadowsocks2022; _restart_service ;;
             5) _view_nodes ;;
             6) _delete_node ;;
-            7) _restart_service ;;
-            8) _view_status ;;
-            9) _uninstall ;;
+            7) _change_outbound ;;
+            8) _restart_service ;;
+            9) _view_status ;;
+            10) _uninstall ;;
             0) exit 0 ;;
             *) _warning "无效选项" ;;
         esac
