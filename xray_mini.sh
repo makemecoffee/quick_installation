@@ -1197,6 +1197,30 @@ change_outbound() {
     esac
 }
 
+# --- 安装全局命令 ---
+install_global_command() {
+    local target="/usr/local/bin/xrm"
+    local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh"
+    
+    # 检查是否已安装
+    if [ -f "$target" ]; then
+        success "全局命令 xrm 已安装"
+        return 0
+    fi
+    
+    info "正在安装全局命令 xrm..."
+    
+    # 下载脚本到 /usr/local/bin/xrm
+    if curl -fsSL "$script_url" -o "$target"; then
+        chmod +x "$target"
+        success "✓ 全局命令 xrm 安装成功！"
+        info "现在可以在任何目录使用 xrm 命令"
+    else
+        error "全局命令安装失败"
+        return 1
+    fi
+}
+
 # --- 主菜单 ---
 show_menu() {
     echo -e "\n${cyan}=== Xray 快速安装脚本 ===${none}"
@@ -1247,6 +1271,11 @@ main() {
     
     # 初始化配置
     init_config || exit 1
+    
+    # 第一次运行时安装全局命令
+    if [ ! -f "/usr/local/bin/xrm" ]; then
+        install_global_command
+    fi
     
     # 主循环
     while true; do
