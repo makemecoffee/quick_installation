@@ -1203,7 +1203,7 @@ install_global_command() {
     local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh"
     
     # 检查是否已安装
-    if [ -f "$target" ]; then
+    if [ -f "$target" ] && [ -x "$target" ]; then
         success "全局命令 xrm 已安装"
         return 0
     fi
@@ -1212,9 +1212,16 @@ install_global_command() {
     
     # 下载脚本到 /usr/local/bin/xrm
     if curl -fsSL "$script_url" -o "$target"; then
+        # 确保有执行权限
         chmod +x "$target"
-        success "✓ 全局命令 xrm 安装成功！"
-        info "现在可以在任何目录使用 xrm 命令"
+        # 验证权限
+        if [ -x "$target" ]; then
+            success "✓ 全局命令 xrm 安装成功！"
+            info "现在可以在任何目录使用 xrm 命令"
+        else
+            error "设置执行权限失败"
+            return 1
+        fi
     else
         error "全局命令安装失败"
         return 1
