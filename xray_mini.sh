@@ -985,6 +985,7 @@ uninstall_xray() {
     echo "  - Xray 系统服务"
     echo "  - 所有节点配置和元数据"
     echo "  - GeoIP/GeoSite 数据文件"
+    echo "  - 全局命令 xrm"
     echo
     
     read -p "确认完全卸载 Xray? [Y/n]: " confirm
@@ -1061,6 +1062,12 @@ uninstall_xray() {
     if [ -d /usr/local/share/xray ]; then
         info "正在删除 GeoIP/GeoSite 数据文件..."
         rm -rf /usr/local/share/xray
+    fi
+    
+    # 删除全局命令
+    if [ -f /usr/local/bin/xrm ]; then
+        info "正在删除全局命令 xrm..."
+        rm -f /usr/local/bin/xrm
     fi
     
     success "Xray 已完全卸载！"
