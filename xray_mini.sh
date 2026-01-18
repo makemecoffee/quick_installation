@@ -450,7 +450,7 @@ init_config() {
     
     jq -n '{
         "log": {
-            "loglevel": "warning"
+            "loglevel": "none"
         },
         "inbounds": [],
         "outbounds": [
@@ -625,6 +625,7 @@ add_ss2022_node() {
         --arg method "$method" \
         '{
             "tag": $tag,
+            "listen": "::",
             "port": ($port | tonumber),
             "protocol": "shadowsocks",
             "settings": {
@@ -751,15 +752,9 @@ add_reality_node() {
     info "私钥 (PrivateKey): $private_key"
     info "公钥 (PublicKey): $public_key"
     
-    # 回落目标自定义
-    read -p "回落目标 (默认: www.microsoft.com:443): " dest
-    [ -z "$dest" ] && dest="www.microsoft.com:443"
-    info "回落目标: $dest"
-    
-    # SNI 自定义
-    read -p "SNI (默认: www.microsoft.com): " sni
-    [ -z "$sni" ] && sni="www.microsoft.com"
-    info "SNI: $sni"
+    # 域名自定义
+    read -p "SNI (默认: www.microsoft.com): " domain
+    [ -z "$domain" ] && domain="www.microsoft.com"
     
     # Short ID 自定义
     read -p "请输入 Short ID (留空自动生成): " short_id
@@ -785,12 +780,12 @@ add_reality_node() {
         --arg tag "$tag" \
         --arg port "$port" \
         --arg uuid "$uuid" \
-        --arg dest "$dest" \
-        --arg sni "$sni" \
+        --arg domain "$domain" \
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
         '{
             "tag": $tag,
+            "listen": "::",
             "port": ($port | tonumber),
             "protocol": "vless",
             "settings": {
@@ -805,9 +800,9 @@ add_reality_node() {
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": $dest,
+                    "dest": ($domain + ":443"),
                     "xver": 0,
-                    "serverNames": [$sni],
+                    "serverNames": [$domain],
                     "privateKey": $private_key,
                     "shortIds": [$short_id]
                 }
@@ -822,10 +817,10 @@ add_reality_node() {
         mv "$temp" "$XRAY_CONFIG_PATH"
     
     # 生成分享链接
-    local share_link="vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${tag}"
+    local share_link="vless://${uuid}@${SERVER_IP}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${domain}&fp=chrome&pbk=${public_key}&sid=${short_id}&type=tcp&headerType=none#${tag}"
     
     # 生成 YAML 配置 - 单行紧凑格式
-    local yaml_config="- {name: ${tag}, type: vless, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${sni}, client-fingerprint: chrome, reality-opts: {public-key: ${public_key}, short-id: ${short_id}}}"
+    local yaml_config="- {name: ${tag}, type: vless, server: ${SERVER_IP}, port: ${port}, uuid: ${uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${domain}, client-fingerprint: chrome, reality-opts: {public-key: ${public_key}, short-id: ${short_id}}}"
     
     # 保存节点信息
     save_node_meta "$tag" "$share_link" "$yaml_config"
