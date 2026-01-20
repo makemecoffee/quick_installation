@@ -1,7 +1,3 @@
-# quick_installation（中文）
-
-English: [README](README.md)
-
 ## 前提条件
 
 请确保系统已安装 `bash` 和 `curl`：
