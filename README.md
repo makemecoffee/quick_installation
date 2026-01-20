@@ -1,10 +1,10 @@
-# quick_installation (English)
+# quick_installation（中文）
 
-Chinese: [README](README_zh.md)
+English: [README](README.md)
 
-## Prerequisites
+## 前提条件
 
-Ensure your system has `bash` and `curl` installed:
+请确保系统已安装 `bash` 和 `curl`：
 
 ### Alpine
 ```sh
@@ -18,33 +18,82 @@ apt update
 apt install -y bash curl
 ```
 
+## Xray 轻量双协议管理脚本
+
+- **一键安装** - 自动安装 Xray 及所有依赖
+- **双协议支持** - Shadowsocks-2022、VLESS-Reality
+- **多系统兼容** - Debian 10+、Ubuntu 20.04+、Alpine 3.14+
+- **交互式配置** - 支持自动生成或手动输入密钥/UUID
+- **自动生成分享** - 生成分享链接和 Clash YAML 配置
+- **出口代理切换** - 支持直连和 SS2022 出口
+- **配置管理** - 节点元数据持久化存储
+- **自动更新** - 支持检测和升级 Xray 版本
+- **全局命令** - 安装后使用 `xrm` 快速管理
+
+### 一键安装
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh)
+```
+
+### 快速开始
+
+安装完成后，使用全局命令 `xrm` 打开管理菜单：
+
+```sh
+xrm
+```
+
+### 文件位置
+
+- **Xray 二进制**: `/usr/local/bin/xray`
+- **配置文件**: `/usr/local/etc/xray/config.json`
+- **Clash YAML**: `/usr/local/etc/xray/clash_nodes.yaml`
+- **节点元数据**: `/usr/local/etc/xray/nodes_meta.json`
+- **GeoIP/GeoSite**: `/usr/local/share/xray/`
+- **全局命令**: `/usr/local/bin/xrm`
+
+### 系统服务
+
+**Debian/Ubuntu (systemd)**:
+
+```sh
+systemctl status xray    # 查看状态
+systemctl restart xray   # 重启服务
+systemctl stop xray      # 停止服务
+journalctl -u xray -f    # 查看日志
+```
+
+**Alpine (OpenRC)**:
+
+```sh
+rc-service xray status   # 查看状态
+rc-service xray restart  # 重启服务
+rc-service xray stop     # 停止服务
+tail -f /var/log/xray/   # 查看日志
+```
+
 ---
 
-## Notice
+## sing-box 轻量四协议管理脚本
 
-- Manual input is required for options without default values.
+- **一键安装** - 自动安装 sing-box 及所有依赖
+- **多协议支持** - VLESS-REALITY、Hysteria2、TUICv5、Shadowsocks-2022
+- **多系统兼容** - Debian 10+、Ubuntu 20.04+、Alpine 3.14+
+- **交互式菜单** - 简洁友好的界面
+- **自动生成分享** - 生成 URI 分享链接和 Clash YAML 配置
+- **配置持久化** - 自动保存节点元数据，便于查看与管理
+- 全局命令：安装后使用 `sbm` 快速管理
 
----
-
-## sing-box Lightweight Four-Protocol Management Script
-
-- **One-Click Installation** - Automatically install sing-box and all dependencies
-- **Multi-Protocol Support** - VLESS-REALITY, Hysteria2, TUICv5, Shadowsocks-2022
-- **Multi-System Compatible** - Debian 10+, Ubuntu 20.04+, Alpine 3.14+
-- **Interactive Menu** - Clean and user-friendly interface
-- **Auto-Generate Shares** - Generate URI share links and Clash YAML configs
-- **Config Persistence** - Automatically save node metadata for easy viewing and management
-- Global Command: Use `sbm` for quick management after installation
-
-### One-Click Installation
+### 一键安装
 
 ```sh
 bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/singbox_mini.sh)
 ```
 
-### Quick Start
+### 快速开始
 
-After installation, use the global command `sbm` to open the management menu:
+安装完成后，使用全局命令 `sbm` 打开管理菜单：
 
 ```sh
 sbm
@@ -52,149 +101,8 @@ sbm
 
 ---
 
-## Xray Lightweight Dual-Protocol Management Script
+## 📄 免责声明
 
-- **One-Click Installation** - Automatically install Xray and all dependencies
-- **Dual-Protocol Support** - Shadowsocks-2022, VLESS-Reality
-- **Multi-System Compatible** - Debian 10+, Ubuntu 20.04+, Alpine 3.14+
-- **Interactive Configuration** - Support auto-generation or manual input of keys/UUIDs
-- **Auto-Generate Shares** - Generate share links and Clash YAML configs
-- **Outbound Proxy Switching** - Support direct connection and SS2022 outbound
-- **Config Management** - Persistent storage of node metadata
-- **Auto Update** - Support detection and upgrade of Xray versions
-- Global Command: Use `xrm` for quick management after installation
+本项目仅用于学习和交流用途。用户需对使用这些脚本产生的所有后果负责。
 
-### One-Click Installation
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh)
-```
-
-### Quick Start
-
-After installation, use the global command `xrm` to open the management menu:
-
-```sh
-xrm
-```
-
-### Main Features
-
-#### Node Management
-1. **Add Shadowsocks 2022 Node**
-   - Fixed encryption: `2022-blake3-aes-128-gcm`
-   - Support custom port, tag, password
-   - Auto-generate share links and Clash config
-
-2. **Add VLESS Reality Node**
-   - Auto-generate UUID and Reality keypair
-   - Support custom fallback target and SNI
-   - Optional manual input or auto-generate Short ID
-
-3. **View Nodes**
-   - Display all added node information
-   - Include share links and Clash YAML configs
-
-4. **Delete Node**
-   - Interactive selection of node to delete
-   - Double confirmation to prevent accidental deletion
-   - Auto-restart service to apply changes
-
-#### Outbound Configuration
-5. **Modify Outbound**
-   - **Direct Mode** - Direct internet access
-   - **SS2022 Proxy** - Route through upstream Shadowsocks server
-   - Auto-validate server address and port
-   - Auto-restart service after configuration
-
-#### System Management
-6. **Upgrade Xray**
-   - Auto-detect latest version
-   - Display current and latest version comparison
-   - Optional upgrade
-
-7. **Restart Xray**
-   - Manually restart service to apply config changes
-   - Auto-detect service status
-
-8. **View Status**
-   - Display Xray service running status
-   - View recent log output
-
-9. **Uninstall Xray**
-   - Completely remove Xray and all configs
-   - Delete global command `xrm`
-   - Double confirmation to prevent accidental operations
-
-### File Locations
-
-- **Xray Binary**: `/usr/local/bin/xray`
-- **Config File**: `/usr/local/etc/xray/config.json`
-- **Clash YAML**: `/usr/local/etc/xray/clash_nodes.yaml`
-- **Node Metadata**: `/usr/local/etc/xray/nodes_meta.json`
-- **GeoIP/GeoSite**: `/usr/local/share/xray/`
-- **Global Command**: `/usr/local/bin/xrm`
-
-### System Service
-
-**Debian/Ubuntu (systemd)**:
-```sh
-systemctl status xray    # View status
-systemctl restart xray   # Restart service
-systemctl stop xray      # Stop service
-journalctl -u xray -f    # View logs
-```
-
-**Alpine (OpenRC)**:
-```sh
-rc-service xray status   # View status
-rc-service xray restart  # Restart service
-rc-service xray stop     # Stop service
-tail -f /var/log/xray/   # View logs
-```
-
-### Configuration Examples
-
-#### Add SS2022 Node Process
-```
-1. Select "1) Add Shadowsocks 2022 Node"
-2. Choose to use IP or domain
-3. Enter port (default: 443)
-4. Enter tag (default: ss-port)
-5. Enter password (leave empty for auto-generation)
-6. Auto-generate share link and Clash config
-7. Auto-restart service
-```
-
-#### Add Reality Node Process
-```
-1. Select "2) Add VLESS Reality Node"
-2. Choose to use IP or domain
-3. Enter port (default: 443)
-4. Enter tag (default: vvr-port)
-5. Enter UUID (leave empty for auto-generation)
-6. Auto-generate Reality keypair
-7. Enter fallback target (default: www.microsoft.com:443)
-8. Enter SNI (default: www.microsoft.com)
-9. Enter Short ID (leave empty for auto-generation)
-10. Auto-generate share link and Clash config
-11. Auto-restart service
-```
-
-#### Switch Outbound Proxy Process
-```
-1. Select "5) Modify Outbound"
-2. Select outbound type:
-   - 1) Direct
-   - 2) SS2022 Proxy
-3. If SS2022 is selected:
-   - Enter upstream server address
-   - Enter upstream server port
-   - Enter upstream server password
-4. Auto-restart service to apply config
-```
-
-### Important Notes
-
-⚠️ **Important**:
-- Root privileges required for first run
+---
