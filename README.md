@@ -61,6 +61,10 @@ chmod +x /usr/local/bin/xrm
 - **GeoIP/GeoSite**: `/usr/local/share/xray/`
 - **全局命令**: `/usr/local/bin/xrm`
 
+### 特别提示
+
+若只希望tcp入站请在**配置文件**: `/usr/local/etc/xray/config.json`修改"network"方式
+
 ### 系统服务
 
 **Debian/Ubuntu (systemd)**:
