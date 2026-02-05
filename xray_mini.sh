@@ -1247,16 +1247,69 @@ select_and_apply_profile() {
     fi
 }
 
+# --- 删除已保存的 SS2022 配置 ---
+delete_ss2022_profile() {
+    if ! list_ss2022_profiles; then
+        return 1
+    fi
+    
+    local count
+    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE")
+    
+    echo
+    read -p "请选择要删除的配置编号 [1-$count] (0 返回): " choice
+    
+    if [ "$choice" = "0" ]; then
+        return 0
+    fi
+    
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+        error "无效的选择"
+        return 1
+    fi
+    
+    local index=$((choice - 1))
+    local profile
+    profile=$(jq -r ".[$index]" "$OUTBOUND_PROFILES_FILE")
+    
+    local name
+    name=$(echo "$profile" | jq -r '.name')
+    
+    # 二次确认
+    read -p "确认删除配置 '$name'? [Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消删除"
+        return 0
+    fi
+    
+    local temp
+    temp=$(mktemp)
+    
+    jq "del(.[$index])" "$OUTBOUND_PROFILES_FILE" > "$temp" && mv "$temp" "$OUTBOUND_PROFILES_FILE"
+    
+    if [ $? -eq 0 ]; then
+        success "配置 '$name' 已删除"
+    else
+        error "删除失败"
+        rm -f "$temp"
+        return 1
+    fi
+}
+
 change_outbound() {
     echo -e "\n${cyan}=== 修改出口配置 ===${none}\n"
-    echo "1) 直连 "
-    echo "2) 添加SS2022 出口"
-    echo "3) 选择 SS2022 出口"
-    echo "4) 查看已保存的配置"
+    echo
+    echo "1) 直连出口"
+    echo "=========================="
+    echo "2) 添加出口"
+    echo "3) 选择出口"
+    echo "=========================="
+    echo "4) 查看出口"
+    echo "5) 删除出口"
     echo "0) 返回主菜单"
     echo
     
-    read -p "请选择操作 [0-4]: " outbound_choice
+    read -p "请选择操作 [0-5]: " outbound_choice
     
     case $outbound_choice in
         1)
@@ -1326,6 +1379,10 @@ change_outbound() {
         4)
             # 查看已保存的配置
             list_ss2022_profiles
+            ;;
+        5)
+            # 删除已保存的配置
+            delete_ss2022_profile
             ;;
         0)
             info "返回主菜单"
