@@ -15,6 +15,7 @@ readonly XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json"
 readonly XRAY_BINARY_PATH="/usr/local/bin/xray"
 readonly YAML_NODES_FILE="/usr/local/etc/xray/clash_nodes.yaml"
 readonly NODES_META_FILE="/usr/local/etc/xray/nodes_meta.json"
+readonly OUTBOUND_PROFILES_FILE="/usr/local/etc/xray/outbound_profiles.json"
 
 # --- 检查是否为 root 用户 ---
 check_root() {
@@ -1097,14 +1098,165 @@ restart_xray() {
 }
 
 # --- 修改出口配置 ---
+# --- 初始化出口配置文件 ---
+init_outbound_profiles() {
+    if [ ! -f "$OUTBOUND_PROFILES_FILE" ]; then
+        echo '[]' > "$OUTBOUND_PROFILES_FILE"
+    fi
+}
+
+# --- 保存 SS2022 出口配置 ---
+save_ss2022_profile() {
+    local name="$1" server="$2" port="$3" password="$4"
+    local method="2022-blake3-aes-128-gcm"
+    
+    init_outbound_profiles
+    
+    local temp
+    temp=$(mktemp)
+    
+    # 检查是否已存在同名配置
+    if jq -e ".[] | select(.name == \"$name\")" "$OUTBOUND_PROFILES_FILE" >/dev/null 2>&1; then
+        # 更新已存在的配置
+        jq --arg name "$name" \
+           --arg server "$server" \
+           --arg port "$port" \
+           --arg password "$password" \
+           --arg method "$method" \
+           'map(if .name == $name then {
+               "name": $name,
+               "server": $server,
+               "port": $port,
+               "password": $password,
+               "method": $method
+           } else . end)' "$OUTBOUND_PROFILES_FILE" > "$temp" && mv "$temp" "$OUTBOUND_PROFILES_FILE"
+    else
+        # 添加新配置
+        jq --arg name "$name" \
+           --arg server "$server" \
+           --arg port "$port" \
+           --arg password "$password" \
+           --arg method "$method" \
+           '. += [{
+               "name": $name,
+               "server": $server,
+               "port": $port,
+               "password": $password,
+               "method": $method
+           }]' "$OUTBOUND_PROFILES_FILE" > "$temp" && mv "$temp" "$OUTBOUND_PROFILES_FILE"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        success "配置 '$name' 已保存"
+    else
+        error "保存配置失败"
+        rm -f "$temp"
+        return 1
+    fi
+}
+
+# --- 应用 SS2022 出口配置 ---
+apply_ss2022_outbound() {
+    local server="$1" port="$2" password="$3"
+    local method="2022-blake3-aes-128-gcm"
+    
+    local temp
+    temp=$(mktemp)
+    
+    jq --arg server "$server" \
+       --arg port "$port" \
+       --arg password "$password" \
+       --arg method "$method" \
+       '.outbounds = [{
+           "protocol": "shadowsocks",
+           "settings": {
+               "servers": [{
+                   "address": $server,
+                   "port": ($port | tonumber),
+                   "method": $method,
+                   "password": $password
+               }]
+           }
+       }]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+    
+    if [ $? -eq 0 ]; then
+        success "已切换到 SS2022 出口"
+        info "服务器: $server:$port"
+        return 0
+    else
+        error "配置失败"
+        rm -f "$temp"
+        return 1
+    fi
+}
+
+# --- 查看已保存的 SS2022 配置 ---
+list_ss2022_profiles() {
+    init_outbound_profiles
+    
+    local count
+    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE")
+    
+    if [ "$count" -eq 0 ]; then
+        info "暂无已保存的出口配置"
+        return 1
+    fi
+    
+    echo -e "\n${cyan}=== 已保存的 SS2022 出口配置 ===${none}\n"
+    
+    jq -r 'to_entries[] | "\(.key + 1)) \(.value.name) - \(.value.server):\(.value.port)"' "$OUTBOUND_PROFILES_FILE"
+    
+    return 0
+}
+
+# --- 选择并应用已保存的配置 ---
+select_and_apply_profile() {
+    if ! list_ss2022_profiles; then
+        return 1
+    fi
+    
+    local count
+    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE")
+    
+    echo
+    read -p "请选择配置编号 [1-$count] (0 返回): " choice
+    
+    if [ "$choice" = "0" ]; then
+        return 0
+    fi
+    
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+        error "无效的选择"
+        return 1
+    fi
+    
+    local index=$((choice - 1))
+    local profile
+    profile=$(jq -r ".[$index]" "$OUTBOUND_PROFILES_FILE")
+    
+    local name server port password
+    name=$(echo "$profile" | jq -r '.name')
+    server=$(echo "$profile" | jq -r '.server')
+    port=$(echo "$profile" | jq -r '.port')
+    password=$(echo "$profile" | jq -r '.password')
+    
+    info "正在应用配置: $name"
+    
+    if apply_ss2022_outbound "$server" "$port" "$password"; then
+        restart_xray
+    fi
+}
+
 change_outbound() {
     echo -e "\n${cyan}=== 修改出口配置 ===${none}\n"
     echo "1) 直连 (Freedom)"
-    echo "2) Shadowsocks 2022"
+    echo "2) 添加新的 SS2022 出口"
+    echo "3) 选择已保存的 SS2022 配置"
+    echo "4) 查看已保存的配置"
     echo "0) 返回主菜单"
     echo
     
-    read -p "请选择出口类型 [0-2]: " outbound_choice
+    read -p "请选择操作 [0-4]: " outbound_choice
     
     case $outbound_choice in
         1)
@@ -1130,11 +1282,17 @@ change_outbound() {
             fi
             ;;
         2)
-            # SS2022 出口
+            # 添加新的 SS2022 出口
             info "配置 Shadowsocks 2022 出口"
             echo
             
-            local ss_server ss_port ss_password ss_method
+            local ss_name ss_server ss_port ss_password
+            
+            read -p "配置名称 (用于保存): " ss_name
+            if [ -z "$ss_name" ]; then
+                error "配置名称不能为空"
+                return 1
+            fi
             
             read -p "服务器地址: " ss_server
             if [ -z "$ss_server" ]; then
@@ -1142,51 +1300,37 @@ change_outbound() {
                 return 1
             fi
             
-            read -p "请输入端口: " ss_port
+            read -p "端口: " ss_port
             if [ -z "$ss_port" ] || ! [[ "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -lt 1 ] || [ "$ss_port" -gt 65535 ]; then
                 error "无效的端口号"
                 return 1
             fi
             
-            read -p "请输入密码: " ss_password
+            read -p "密码: " ss_password
             if [ -z "$ss_password" ]; then
                 error "密码不能为空"
                 return 1
             fi
             
-            # 固定使用 2022-blake3-aes-128-gcm
-            ss_method="2022-blake3-aes-128-gcm"
-            info "加密方法: $ss_method"
+            info "加密方法: 2022-blake3-aes-128-gcm"
             
-            info "正在配置 SS2022 出口..."
-            local temp
-            temp=$(mktemp)
-            
-            jq --arg server "$ss_server" \
-               --arg port "$ss_port" \
-               --arg password "$ss_password" \
-               --arg method "$ss_method" \
-               '.outbounds = [{
-                   "protocol": "shadowsocks",
-                   "settings": {
-                       "servers": [{
-                           "address": $server,
-                           "port": ($port | tonumber),
-                           "method": $method,
-                           "password": $password
-                       }]
-                   }
-               }]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
-            
-            if [ $? -eq 0 ]; then
-                success "已切换到 SS2022 出口"
-                info "上游服务器: $ss_server:$ss_port"
+            # 应用配置
+            if apply_ss2022_outbound "$ss_server" "$ss_port" "$ss_password"; then
+                # 询问是否保存
+                read -p "是否保存此配置以便下次使用? [Y/n]: " save_choice
+                if [[ ! "$save_choice" =~ ^[Nn]$ ]]; then
+                    save_ss2022_profile "$ss_name" "$ss_server" "$ss_port" "$ss_password"
+                fi
                 restart_xray
-            else
-                error "配置失败"
-                rm -f "$temp"
-                return 1
             fi
+            ;;
+        3)
+            # 选择已保存的配置
+            select_and_apply_profile
+            ;;
+        4)
+            # 查看已保存的配置
+            list_ss2022_profiles
             ;;
         0)
             info "返回主菜单"
