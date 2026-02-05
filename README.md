@@ -21,7 +21,7 @@ apt install -y bash curl
 - **多系统兼容** - Debian 10+、Ubuntu 20.04+、Alpine 3.14+
 - **交互式配置** - 支持自动生成或手动输入密钥/UUID
 - **自动生成分享** - 生成分享链接和 Clash YAML 配置
-- **出口代理切换** - 支持直连和 SS2022 出口
+- **出口代理切换** - 支持直连和 切换SS2022 出口
 - **配置管理** - 节点元数据持久化存储
 - **自动更新** - 支持检测和升级 Xray 版本
 - **全局命令** - 安装后使用 `xrm` 快速管理
@@ -83,7 +83,7 @@ tail -f /var/log/xray/   # 查看日志
 
 ---
 
-## sing-box 轻量四协议管理脚本
+## sing-box 轻量四协议管理脚本（不再维护）
 
 - **一键安装** - 自动安装 sing-box 及所有依赖
 - **多协议支持** - VLESS-REALITY、Hysteria2、TUICv5、Shadowsocks-2022
