@@ -1218,7 +1218,7 @@ install_global_command() {
         chmod +x "$target"
         # 验证权限
         if [ -x "$target" ]; then
-            success "✓ 全局命令 xrm 安装成功！"
+            success "全局命令 xrm 安装成功！"
             info "现在可以在任何目录使用 xrm 命令"
         else
             error "设置执行权限失败"
@@ -1249,17 +1249,17 @@ show_menu() {
     
     echo "1) 添加 Shadowsocks 2022 节点"
     echo "2) 添加 VLESS Reality 节点"
-    echo "------------------------------------"
+    echo "- - - - - - - - - - - - - - -"
     echo "3) 查看节点"
     echo "4) 删除节点"
-    echo "------------------------------------"
+    echo "- - - - - - - - - - - - - - -"
     echo "5) 出口配置"
-    echo "------------------------------------"
+    echo "- - - - - - - - - - - - - - -"
     echo "6) 升级 Xray"
     echo "7) 重启 Xray"
     echo "8) 查看状态"
     echo "9) 卸载 Xray"
-    echo "------------------------------------"
+    echo "- - - - - - - - - - - - - - -"
     echo "0) 退出脚本"
     echo
 }

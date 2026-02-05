@@ -40,6 +40,18 @@ bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installat
 xrm
 ```
 
+### 更新脚本
+
+如果 GitHub 上发布了新版本，可以通过以下方式更新脚本：
+
+**更新全局命令**
+```sh
+curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh -o /usr/local/bin/xrm
+chmod +x /usr/local/bin/xrm
+```
+
+> 💡 更新脚本不会影响已有的配置和节点，所有数据都安全保留在 `/usr/local/etc/xray/` 目录下。
+
 ### 文件位置
 
 - **Xray 二进制**: `/usr/local/bin/xray`
