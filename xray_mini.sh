@@ -1249,9 +1249,9 @@ select_and_apply_profile() {
 
 change_outbound() {
     echo -e "\n${cyan}=== 修改出口配置 ===${none}\n"
-    echo "1) 直连 (Freedom)"
-    echo "2) 添加新的 SS2022 出口"
-    echo "3) 选择已保存的 SS2022 配置"
+    echo "1) 直连 "
+    echo "2) 添加SS2022 出口"
+    echo "3) 选择 SS2022 出口"
     echo "4) 查看已保存的配置"
     echo "0) 返回主菜单"
     echo
@@ -1283,7 +1283,7 @@ change_outbound() {
             ;;
         2)
             # 添加新的 SS2022 出口
-            info "配置 Shadowsocks 2022 出口"
+            info "添加 Shadowsocks 2022 出口"
             echo
             
             local ss_name ss_server ss_port ss_password
@@ -1314,14 +1314,9 @@ change_outbound() {
             
             info "加密方法: 2022-blake3-aes-128-gcm"
             
-            # 应用配置
-            if apply_ss2022_outbound "$ss_server" "$ss_port" "$ss_password"; then
-                # 询问是否保存
-                read -p "是否保存此配置以便下次使用? [Y/n]: " save_choice
-                if [[ ! "$save_choice" =~ ^[Nn]$ ]]; then
-                    save_ss2022_profile "$ss_name" "$ss_server" "$ss_port" "$ss_password"
-                fi
-                restart_xray
+            # 保存配置（不立即应用）
+            if save_ss2022_profile "$ss_name" "$ss_server" "$ss_port" "$ss_password"; then
+                info "配置已保存，请使用选项 3 选择并应用配置"
             fi
             ;;
         3)
@@ -1393,17 +1388,17 @@ show_menu() {
     
     echo "1) 添加 Shadowsocks 2022 节点"
     echo "2) 添加 VLESS Reality 节点"
-    echo "=================="
+    echo "=========================="
     echo "3) 查看节点"
     echo "4) 删除节点"
-    echo "=================="
+    echo "=========================="
     echo "5) 出口配置"
-    echo "=================="
+    echo "=========================="
     echo "6) 升级 Xray"
     echo "7) 重启 Xray"
     echo "8) 查看状态"
     echo "9) 卸载 Xray"
-    echo "=================="
+    echo "=========================="
     echo "0) 退出脚本"
     echo
 }
