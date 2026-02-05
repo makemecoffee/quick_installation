@@ -1393,17 +1393,17 @@ show_menu() {
     
     echo "1) 添加 Shadowsocks 2022 节点"
     echo "2) 添加 VLESS Reality 节点"
-    echo "- - - - - - - - - - - - - - -"
+    echo "=================="
     echo "3) 查看节点"
     echo "4) 删除节点"
-    echo "- - - - - - - - - - - - - - -"
+    echo "=================="
     echo "5) 出口配置"
-    echo "- - - - - - - - - - - - - - -"
+    echo "=================="
     echo "6) 升级 Xray"
     echo "7) 重启 Xray"
     echo "8) 查看状态"
     echo "9) 卸载 Xray"
-    echo "- - - - - - - - - - - - - - -"
+    echo "=================="
     echo "0) 退出脚本"
     echo
 }
