@@ -753,9 +753,13 @@ add_reality_node() {
     info "私钥 (PrivateKey): $private_key"
     info "公钥 (PublicKey): $public_key"
     
-    # 域名自定义
+    # SNI 域名自定义
     read -p "SNI (默认: www.microsoft.com): " domain
     [ -z "$domain" ] && domain="www.microsoft.com"
+
+    # Reality dest 自定义（格式通常为 host:port）
+    read -p "dest (默认: ${domain}:443): " dest
+    [ -z "$dest" ] && dest="${domain}:443"
     
     # Short ID 自定义
     read -p "请输入 Short ID (留空自动生成): " short_id
@@ -782,6 +786,7 @@ add_reality_node() {
         --arg port "$port" \
         --arg uuid "$uuid" \
         --arg domain "$domain" \
+        --arg dest "$dest" \
         --arg private_key "$private_key" \
         --arg short_id "$short_id" \
         '{
@@ -801,7 +806,7 @@ add_reality_node() {
                 "security": "reality",
                 "realitySettings": {
                     "show": false,
-                    "dest": ($domain + ":443"),
+                    "dest": $dest,
                     "xver": 0,
                     "serverNames": [$domain],
                     "privateKey": $private_key,
