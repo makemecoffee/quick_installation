@@ -456,12 +456,31 @@ init_config() {
         "inbounds": [],
         "outbounds": [
             {
-                "protocol": "freedom",
-                "settings": {
-                    "domainStrategy": "AsIs"
-                }
+                "tag": "direct",
+                "protocol": "freedom"
+            },
+            {
+                "tag": "block",
+                "protocol": "blackhole"
             }
-        ]
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {
+                    "ip": ["geoip:private"],
+                    "outboundTag": "block"
+                },
+                {
+                    "ip": ["geoip:cn"],
+                    "outboundTag": "block"
+                },
+                {
+                    "domain": ["geosite:category-ads-all"],
+                    "outboundTag": "block"
+                }
+            ]
+        }
     }' > "$XRAY_CONFIG_PATH"
     
     if [ $? -eq 0 ]; then
@@ -485,6 +504,45 @@ EOF
     if [ ! -f "$NODES_META_FILE" ]; then
         echo '{"nodes":[]}' > "$NODES_META_FILE"
         success "节点元数据文件已创建: $NODES_META_FILE"
+    fi
+}
+
+# --- 初始化/补齐路由策略（仅执行一次）---
+ensure_routing_policy() {
+    if [ ! -f "$XRAY_CONFIG_PATH" ]; then
+        error "配置文件不存在: $XRAY_CONFIG_PATH"
+        return 1
+    fi
+
+    # 已存在 routing 则不覆盖，避免改动用户自定义分流。
+    if jq -e '.routing != null' "$XRAY_CONFIG_PATH" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local temp
+    temp=$(mktemp)
+
+    jq '.routing = {
+           "domainStrategy": "IPIfNonMatch",
+           "rules": [
+               {
+                   "ip": ["geoip:private"],
+                   "outboundTag": "block"
+               },
+               {
+                   "ip": ["geoip:cn"],
+                   "outboundTag": "block"
+               }
+           ]
+       }' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+
+    if [ $? -eq 0 ]; then
+        success "已初始化路由策略（禁止回国流量）"
+        return 0
+    else
+        error "初始化路由策略失败"
+        rm -f "$temp"
+        return 1
     fi
 }
 
@@ -1161,6 +1219,32 @@ save_ss2022_profile() {
 }
 
 # --- 应用 SS2022 出口配置 ---
+apply_direct_outbound() {
+    local temp
+    temp=$(mktemp)
+
+    jq '.outbounds = [
+           {
+               "tag": "direct",
+               "protocol": "freedom"
+           },
+           {
+               "tag": "block",
+               "protocol": "blackhole"
+           }
+       ]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+
+    if [ $? -eq 0 ]; then
+        success "已切换到直连出口"
+        return 0
+    else
+        error "配置失败"
+        rm -f "$temp"
+        return 1
+    fi
+}
+
+# --- 应用 SS2022 出口配置 ---
 apply_ss2022_outbound() {
     local server="$1" port="$2" password="$3"
     local method="2022-blake3-aes-128-gcm"
@@ -1172,17 +1256,24 @@ apply_ss2022_outbound() {
        --arg port "$port" \
        --arg password "$password" \
        --arg method "$method" \
-       '.outbounds = [{
-           "protocol": "shadowsocks",
-           "settings": {
-               "servers": [{
-                   "address": $server,
-                   "port": ($port | tonumber),
-                   "method": $method,
-                   "password": $password
-               }]
+       '.outbounds = [
+           {
+               "tag": "proxy",
+               "protocol": "shadowsocks",
+               "settings": {
+                   "servers": [{
+                       "address": $server,
+                       "port": ($port | tonumber),
+                       "method": $method,
+                       "password": $password
+                   }]
+               }
+           },
+           {
+               "tag": "block",
+               "protocol": "blackhole"
            }
-       }]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+       ]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
     
     if [ $? -eq 0 ]; then
         success "已切换到 SS2022 出口"
@@ -1320,22 +1411,9 @@ change_outbound() {
         1)
             # 直连出口
             info "正在配置直连出口..."
-            local temp
-            temp=$(mktemp)
-            
-            jq '.outbounds = [{
-                "protocol": "freedom",
-                "settings": {
-                    "domainStrategy": "AsIs"
-                }
-            }]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
-            
-            if [ $? -eq 0 ]; then
-                success "已切换到直连出口"
+            if apply_direct_outbound; then
                 restart_xray
             else
-                error "配置失败"
-                rm -f "$temp"
                 return 1
             fi
             ;;
@@ -1485,6 +1563,9 @@ main() {
     
     # 初始化配置
     init_config || exit 1
+
+    # 仅在启动时确保一次路由策略
+    ensure_routing_policy || exit 1
     
     # 第一次运行时安装全局命令
     if [ ! -f "/usr/local/bin/xrm" ]; then
