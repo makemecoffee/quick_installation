@@ -97,9 +97,7 @@ nano /usr/local/etc/xray/config.json
 ```json
 {
   "domain": [
-    "geosite:openai",
-    "geosite:anthropic",
-    "geosite:perplexity"
+    "geosite:category-ai-!cn"
   ],
   "outboundTag": "ai"
 },
