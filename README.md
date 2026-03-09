@@ -84,7 +84,45 @@ rc-service xray restart  # 重启服务
 rc-service xray stop     # 停止服务
 tail -f /var/log/xray/   # 查看日志
 ```
+### AI 分流
 
+1. 编辑配置文件：
+
+```sh
+nano /usr/local/etc/xray/config.json
+```
+
+2. 在 `routing` 中添加 AI 站点分流规则：
+
+```json
+{
+  "domain": [
+    "geosite:openai",
+    "geosite:anthropic",
+    "geosite:perplexity"
+  ],
+  "outboundTag": "ai"
+},
+```
+
+3. 在 `outbounds` 中添加 `ai` 出口：
+
+```json
+{
+  "tag": "ai",
+  "protocol": "shadowsocks",
+  "settings": {
+    "servers": [
+      {
+        "address": "ip",
+        "port": 1-65535,
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "password"
+      }
+    ]
+  }
+},
+```
 ---
 
 ## sing-box 轻量四协议管理脚本（不再维护）

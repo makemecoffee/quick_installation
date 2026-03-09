@@ -474,10 +474,6 @@ init_config() {
                 {
                     "ip": ["geoip:cn"],
                     "outboundTag": "block"
-                },
-                {
-                    "domain": ["geosite:category-ads-all"],
-                    "outboundTag": "block"
                 }
             ]
         }
