@@ -94,26 +94,64 @@ install_xray() {
     
     # 调用下载和安装函数
     download_and_install_xray "$version" || return 1
-    
-    # 下载 GeoIP / GeoSite 数据文件
-    info "正在下载 GeoIP / GeoSite 数据文件..."
-    
-    if ! curl -fsSL --max-time 120 -o /usr/local/share/xray/geoip.dat \
-        https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat; then
-        error "下载 geoip.dat 失败"
-        return 1
-    fi
-    
-    if ! curl -fsSL --max-time 120 -o /usr/local/share/xray/geosite.dat \
-        https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat; then
-        error "下载 geosite.dat 失败"
-        return 1
-    fi
+
+    # 下载基础 Geo 数据文件
+    update_geo_data || return 1
     
     # 创建系统服务
     create_service || return 1
     
     success "Xray 安装完成！"
+}
+
+# --- 下载/更新 GeoIP 与 GeoSite 数据文件 ---
+update_geo_data() {
+    local geo_dir="/usr/local/share/xray"
+    local geoip_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    local geosite_url="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+    local tmp_geoip tmp_geosite
+
+    info "正在下载/更新 GeoIP / GeoSite 数据文件..."
+
+    mkdir -p "$geo_dir" || {
+        error "创建目录失败: $geo_dir"
+        return 1
+    }
+
+    tmp_geoip=$(mktemp) || {
+        error "创建临时文件失败 (geoip.dat)"
+        return 1
+    }
+
+    tmp_geosite=$(mktemp) || {
+        rm -f "$tmp_geoip"
+        error "创建临时文件失败 (geosite.dat)"
+        return 1
+    }
+
+    if ! curl -fsSL --max-time 120 -o "$tmp_geoip" "$geoip_url"; then
+        rm -f "$tmp_geoip" "$tmp_geosite"
+        error "下载 geoip.dat 失败"
+        return 1
+    fi
+
+    if ! curl -fsSL --max-time 120 -o "$tmp_geosite" "$geosite_url"; then
+        rm -f "$tmp_geoip" "$tmp_geosite"
+        error "下载 geosite.dat 失败"
+        return 1
+    fi
+
+    install -m 644 "$tmp_geoip" "$geo_dir/geoip.dat" && \
+    install -m 644 "$tmp_geosite" "$geo_dir/geosite.dat"
+
+    if [ $? -ne 0 ]; then
+        rm -f "$tmp_geoip" "$tmp_geosite"
+        error "写入 Geo 数据文件失败"
+        return 1
+    fi
+
+    rm -f "$tmp_geoip" "$tmp_geosite"
+    success "GeoIP / GeoSite 数据文件已更新"
 }
 
 # --- 下载并安装 Xray 核心 ---
@@ -1533,7 +1571,8 @@ show_menu() {
     echo "6) 升级 Xray"
     echo "7) 重启 Xray"
     echo "8) 查看状态"
-    echo "9) 卸载 Xray"
+    echo "9) 更新 GeoIP / GeoSite 数据文件"
+    echo "10) 卸载 Xray"
     echo "=========================="
     echo "0) 退出脚本"
     echo
@@ -1571,7 +1610,7 @@ main() {
     # 主循环
     while true; do
         show_menu
-        read -p "请选择操作 [0-9]: " choice
+        read -p "请选择操作 [0-10]: " choice
         
         case $choice in
             1)
@@ -1599,6 +1638,9 @@ main() {
                 show_status
                 ;;
             9)
+                update_geo_data && restart_xray
+                ;;
+            10)
                 uninstall_xray
                 ;;
             0)
