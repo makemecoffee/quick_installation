@@ -617,18 +617,6 @@ save_node_meta() {
     fi
 }
 
-# --- 生成随机端口 ---
-generate_port() {
-    local port
-    while true; do
-        port=$((RANDOM % 55535 + 10000))
-        if ! ss -tuln 2>/dev/null | grep -q ":$port "; then
-            echo "$port"
-            return 0
-        fi
-    done
-}
-
 # --- 生成 UUID ---
 generate_uuid() {
     "$XRAY_BINARY_PATH" uuid 2>/dev/null || {
@@ -1252,7 +1240,7 @@ save_ss2022_profile() {
     fi
 }
 
-# --- 应用 SS2022 出口配置 ---
+# --- 应用 直连出口 配置 ---
 apply_direct_outbound() {
     local temp
     temp=$(mktemp)
@@ -1571,7 +1559,7 @@ show_menu() {
     echo "6) 升级 Xray"
     echo "7) 重启 Xray"
     echo "8) 查看状态"
-    echo "9) 更新 GeoIP / GeoSite 数据文件"
+    echo "9) 更新 GeoIP&GeoSite "
     echo "10) 卸载 Xray"
     echo "=========================="
     echo "0) 退出脚本"
