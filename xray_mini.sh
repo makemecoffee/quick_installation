@@ -799,21 +799,19 @@ add_reality_node() {
         return 1
     fi
     
-    # 从输出中提取所有字段
-    # xray x25519 输出格式:
+    # 从输出中提取字段。
+    # xray x25519 的输出格式在不同版本里会有变化，可能出现：
     # PrivateKey: xxx
-    # Password: xxx  (这实际上是服务端需要用的)
-    # Hash32: xxx    (这实际上是客户端需要的公钥)
-    
-    private_key=$(echo "$keypair" | grep "^PrivateKey:" | awk '{print $2}')
-    
-    # Reality 中，客户端使用的 PublicKey 实际上对应 xray x25519 输出的某个字段
-    # 尝试多种可能的字段名
-    public_key=$(echo "$keypair" | grep -E "^(PublicKey|Password):" | tail -n 1 | awk '{print $2}')
-    
+    # Password (PublicKey): xxx
+    # Hash32: xxx
+    private_key=$(printf '%s\n' "$keypair" | sed -nE 's/^Private(Key)?[[:space:]]*:[[:space:]]*//p' | head -n 1)
+
+    # Reality 客户端使用的 public key，优先匹配新旧格式里的 PublicKey / Password(PublicKey)。
+    public_key=$(printf '%s\n' "$keypair" | sed -nE 's/^((Public(Key)?|Password)([[:space:]]*\(PublicKey\))?)[[:space:]]*:[[:space:]]*//p' | head -n 1)
+
     if [ -z "$public_key" ]; then
-        # 如果还是没有，使用 Password 字段
-        public_key=$(echo "$keypair" | grep "^Password:" | awk '{print $2}')
+        # 某些版本只输出 Hash32，可作为兜底解析。
+        public_key=$(printf '%s\n' "$keypair" | sed -nE 's/^Hash32[[:space:]]*:[[:space:]]*//p' | head -n 1)
     fi
     
     if [ -z "$private_key" ]; then
