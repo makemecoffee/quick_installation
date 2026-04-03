@@ -800,18 +800,40 @@ add_reality_node() {
     fi
     
     # 从输出中提取字段。
-    # xray x25519 的输出格式在不同版本里会有变化，可能出现：
-    # PrivateKey: xxx
-    # Password (PublicKey): xxx
-    # Hash32: xxx
-    private_key=$(printf '%s\n' "$keypair" | sed -nE 's/^Private(Key)?[[:space:]]*:[[:space:]]*//p' | head -n 1)
+    # xray x25519 输出在不同版本中字段名可能不同，使用逐行匹配保证兼容性。
+    local hash32 line value
+    private_key=""
+    public_key=""
+    hash32=""
 
-    # Reality 客户端使用的 public key，优先匹配新旧格式里的 PublicKey / Password(PublicKey)。
-    public_key=$(printf '%s\n' "$keypair" | sed -nE 's/^((Public(Key)?|Password)([[:space:]]*\(PublicKey\))?)[[:space:]]*:[[:space:]]*//p' | head -n 1)
+    while IFS= read -r line; do
+        # 兼容 CRLF
+        line=${line%$'\r'}
 
-    if [ -z "$public_key" ]; then
-        # 某些版本只输出 Hash32，可作为兜底解析。
-        public_key=$(printf '%s\n' "$keypair" | sed -nE 's/^Hash32[[:space:]]*:[[:space:]]*//p' | head -n 1)
+        case "$line" in
+            *PrivateKey:*|*Private\ Key:*)
+                value="${line#*:}"
+                value="${value# }"
+                private_key="$value"
+                ;;
+            *PublicKey:*|*Public\ Key:*|*Password\ \(PublicKey\):*|*Password\(PublicKey\):*|*Password:*)
+                if [ -z "$public_key" ]; then
+                    value="${line#*:}"
+                    value="${value# }"
+                    public_key="$value"
+                fi
+                ;;
+            *Hash32:*)
+                value="${line#*:}"
+                value="${value# }"
+                hash32="$value"
+                ;;
+        esac
+    done <<< "$keypair"
+
+    # 某些版本只输出 Hash32，作为公钥兜底。
+    if [ -z "$public_key" ] && [ -n "$hash32" ]; then
+        public_key="$hash32"
     fi
     
     if [ -z "$private_key" ]; then
