@@ -65,6 +65,46 @@ check_dependencies() {
     fi
 }
 
+# --- 检查端口是否可用 ---
+check_port_available() {
+    local port="$1"
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        error "无效的端口号: ${port} (有效范围: 1-65535)"
+        return 1
+    fi
+
+    # 检查是否与已有 Xray 入站端口冲突
+    if [ -f "$XRAY_CONFIG_PATH" ]; then
+        if jq -e --argjson port "$port" '.inbounds[]? | select((.port? // -1) == $port)' "$XRAY_CONFIG_PATH" >/dev/null 2>&1; then
+            error "端口 ${port} 已在 Xray 配置中使用，请选择其他端口"
+            return 1
+        fi
+    fi
+
+    # 优先使用 ss 检查系统监听端口
+    if command -v ss >/dev/null 2>&1; then
+        if ss -H -lntu 2>/dev/null | awk -v p=":${port}" '$5 ~ p"$" {found=1; exit} END {exit !found}'; then
+            error "端口 ${port} 已被系统其他进程占用，请选择其他端口"
+            return 1
+        fi
+    else
+        # 兜底: 直接读取 /proc/net，避免依赖额外工具
+        local port_hex proc_file
+        port_hex=$(printf '%04X' "$port")
+
+        for proc_file in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+            [ -r "$proc_file" ] || continue
+            if awk -v p=":${port_hex}" 'NR>1 {if (toupper($2) ~ p"$") {found=1; exit}} END {exit !found}' "$proc_file"; then
+                error "端口 ${port} 已被系统占用，请选择其他端口"
+                return 1
+            fi
+        done
+    fi
+
+    return 0
+}
+
 # --- Xray 自动安装函数 ---
 install_xray() {
     # 检查是否已安装
@@ -665,19 +705,22 @@ add_ss2022_node() {
     # 获取服务器地址
     get_server_address || return 1
     
-    local tag port password method
+    local tag port password method port_source
     
     # 端口自定义
     read -p "请输入端口 (默认: 443): " port
     if [ -z "$port" ]; then
         port=443
+        port_source="default"
+    else
+        port_source="custom"
+    fi
+
+    check_port_available "$port" || return 1
+
+    if [ "$port_source" = "default" ]; then
         info "使用默认端口: $port"
     else
-        # 验证端口号
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            error "无效的端口号"
-            return 1
-        fi
         info "使用自定义端口: $port"
     fi
     
@@ -745,18 +788,22 @@ add_reality_node() {
     # 获取服务器地址
     get_server_address || return 1
     
-    local tag port uuid dest sni private_key public_key short_id
+    local tag port uuid dest sni private_key public_key short_id port_source
     
     # 端口自定义
     read -p "端口 (默认: 443): " port
     if [ -z "$port" ]; then
         port=443
+        port_source="default"
+    else
+        port_source="custom"
+    fi
+
+    check_port_available "$port" || return 1
+
+    if [ "$port_source" = "default" ]; then
         info "默认端口: $port"
     else
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-            error "无效的端口号"
-            return 1
-        fi
         info "自定义端口: $port"
     fi
     
