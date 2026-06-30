@@ -901,8 +901,8 @@ add_reality_node() {
     info "公钥 (PublicKey): $public_key"
     
     # SNI 域名自定义
-    read -p "SNI (默认: www.microsoft.com): " domain
-    [ -z "$domain" ] && domain="www.microsoft.com"
+    read -p "SNI (默认: ts2.tc.mm.bing.net): " domain
+    [ -z "$domain" ] && domain="ts2.tc.mm.bing.net"
 
     # Reality dest 自定义（格式通常为 host:port）
     read -p "dest (默认: ${domain}:443): " dest
