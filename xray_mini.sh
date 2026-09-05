@@ -2064,8 +2064,6 @@ manage_xray() {
                 error "无效的选择"
                 ;;
         esac
-
-        read -p "按回车键继续..."
     done
 }
 
@@ -2240,8 +2238,6 @@ main() {
                 error "无效的选择"
                 ;;
         esac
-        
-        read -p "按回车键继续..." 
     done
 }
 
