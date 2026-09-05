@@ -121,33 +121,6 @@ nano /usr/local/etc/xray/config.json
   }
 },
 ```
----
-
-## sing-box 轻量四协议管理脚本（不再维护）
-
-- **一键安装** - 自动安装 sing-box 及所有依赖
-- **多协议支持** - VLESS-REALITY、Hysteria2、TUICv5、Shadowsocks-2022
-- **多系统兼容** - Debian 10+、Ubuntu 20.04+、Alpine 3.14+
-- **交互式菜单** - 简洁友好的界面
-- **自动生成分享** - 生成 URI 分享链接和 Clash YAML 配置
-- **配置持久化** - 自动保存节点元数据，便于查看与管理
-- 全局命令：安装后使用 `sbm` 快速管理
-
-### 一键安装
-
-```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/singbox_mini.sh)
-```
-
-### 快速开始
-
-安装完成后，使用全局命令 `sbm` 打开管理菜单：
-
-```sh
-sbm
-```
-
----
 
 ## 📄 免责声明
 
