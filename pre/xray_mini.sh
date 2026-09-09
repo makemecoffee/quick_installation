@@ -405,7 +405,7 @@ upgrade_xray() {
     # 获取最新版本
     info "获取最新版本"
     local latest_version
-    latest_version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/^v//')
+    latest_version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases | jq -r '.[0].tag_name' | sed 's/^v//')
     
     if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
         error "获取最新版本失败，请检查网络连接"
@@ -2071,7 +2071,7 @@ manage_xray() {
 # --- 安装全局命令 ---
 install_global_command() {
     local target="/usr/local/bin/xrm"
-    local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh"
+    local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/pre/xray_mini.sh"
     
     # 检查是否已安装
     if [ -f "$target" ] && [ -x "$target" ]; then
@@ -2096,7 +2096,7 @@ install_global_command() {
     fi
 
     if ! verify_github_file_digest "$tmpfile" \
-        "https://api.github.com/repos/makemecoffee/quick_installation/contents/xray_mini.sh?ref=master"; then
+        "https://api.github.com/repos/makemecoffee/quick_installation/contents/pre/xray_mini.sh?ref=master"; then
         rm -f "$tmpfile"
         return 1
     fi
@@ -2115,7 +2115,7 @@ install_global_command() {
 # --- 更新全局脚本 ---
 update_script() {
     local target="/usr/local/bin/xrm"
-    local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh"
+    local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/pre/xray_mini.sh"
     local tmpfile
 
     info "正在检查并更新全局命令 xrm..."
@@ -2133,7 +2133,7 @@ update_script() {
     fi
 
     if ! verify_github_file_digest "$tmpfile" \
-        "https://api.github.com/repos/makemecoffee/quick_installation/contents/xray_mini.sh?ref=master"; then
+        "https://api.github.com/repos/makemecoffee/quick_installation/contents/pre/xray_mini.sh?ref=master"; then
         rm -f "$tmpfile"
         return 1
     fi
