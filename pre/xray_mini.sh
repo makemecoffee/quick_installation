@@ -204,9 +204,10 @@ install_xray() {
     check_dependencies || return 1
     
     # 获取最新版本号
+    # version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/^v//')
     info "获取 Xray 最新版本"
     local version
-    version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/^v//')
+    version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases | jq -r '.[0].tag_name' | sed 's/^v//')
     
     if [ -z "$version" ] || [ "$version" = "null" ]; then
         error "获取 Xray 版本号失败，请检查网络连接"
