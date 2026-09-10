@@ -1324,7 +1324,7 @@ add_reality_node() {
     yaml_server=$(yaml_quote "$SERVER_IP")
     yaml_domain=$(yaml_quote "$domain")
     yaml_public_key=$(yaml_quote "$public_key")
-    local yaml_config="- {name: ${yaml_name}, type: vless, server: ${yaml_server}, port: ${port}, uuid: ${uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${yaml_domain}, client-fingerprint: chrome, reality-opts: {public-key: ${yaml_public_key}, short-id: ${short_id}}}"
+    local yaml_config="- {name: ${yaml_name}, type: vless, server: ${yaml_server}, port: ${port}, uuid: ${uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${yaml_domain}, client-fingerprint: chrome, reality-opts: {public-key: ${yaml_public_key}, short-id: ${short_id},upport-x25519mlkem768: true}}"
     
     # 保存节点信息
     if ! save_node_meta "$tag" "$share_link" "$yaml_config"; then
