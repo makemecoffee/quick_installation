@@ -1277,6 +1277,7 @@ add_reality_node() {
                     "xver": 0,
                     "serverNames": [$domain],
                     "privateKey": $private_key,
+                    "minClientVer": "1.0.0",
                     "shortIds": [$short_id]
                 }
             }
