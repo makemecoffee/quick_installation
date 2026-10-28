@@ -1,7 +1,4 @@
-#!/usr/bin/env bash
-
-# 配置字段唯一依据：https://xtls.github.io/llms-full.txt（2026-10-28 读取）。
-# 本次仅修改源码；未运行脚本、Xray 配置验证或服务器连接测试。
+#!/bin/bash
 
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
