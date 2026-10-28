@@ -26,8 +26,24 @@ url_encode() {
     jq -sRr @uri
 }
 
-yaml_quote() {
-    jq -Rn --arg value "$1" '$value'
+# 普通字段直接输出；空值、数字字符串及特殊字符使用单引号，避免 YAML 改变类型或结构。
+yaml_scalar() {
+    local value="$1" lower="${1,,}"
+    local number_pattern='^[-+]?([0-9_]+([.][0-9_]*)?([eE][-+]?[0-9]+)?|[.][0-9_]+|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+)$'
+    case "$lower" in
+        ''|null|true|false|yes|no|on|off|y|n|~|.nan|.inf|+.inf|-.inf)
+            printf "'%s'" "${value//\'/\'\'}"
+            return
+            ;;
+    esac
+    if [[ "$value" =~ ^[[:alnum:]_./+@=-]+$ ]] &&
+       [[ ! "$value" =~ ^[-?:@] ]] &&
+       [[ ! "$value" =~ $number_pattern ]] &&
+       [[ ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+        printf '%s' "$value"
+    else
+        printf "'%s'" "${value//\'/\'\'}"
+    fi
 }
 
 # URI 地址中 IPv6 需要方括号；YAML / Xray 地址使用不带方括号的形式。
@@ -1040,11 +1056,11 @@ add_ss2022_node() {
     local encoded_tag yaml_name yaml_server yaml_password uri_address raw_address
     encoded_tag=$(printf '%s' "$tag" | url_encode) || return 1
     uri_address=$(uri_host "$SERVER_IP")
-    yaml_name=$(yaml_quote "$tag")
+    yaml_name=$(yaml_scalar "$tag")
     raw_address="${SERVER_IP#[}"
     raw_address="${raw_address%]}"
-    yaml_server=$(yaml_quote "$raw_address")
-    yaml_password=$(yaml_quote "$password")
+    yaml_server=$(yaml_scalar "$raw_address")
+    yaml_password=$(yaml_scalar "$password")
     share_link="ss://$(printf '%s' "${method}:${password}" | base64 | tr -d '\n')@${uri_address}:${port}#${encoded_tag}"
     yaml_config="- {name: ${yaml_name}, type: ss, server: ${yaml_server}, port: ${port}, cipher: ${method}, password: ${yaml_password}, udp: true}"
     client_config=$(jq -n --arg tag "$tag" --arg address "${SERVER_IP#[}" \
@@ -1274,14 +1290,14 @@ add_reality_node() {
     encoded_domain=$(printf '%s' "$domain" | url_encode) || return 1
     encoded_public_key=$(printf '%s' "$public_key" | url_encode) || return 1
     uri_address=$(uri_host "$SERVER_IP")
-    yaml_name=$(yaml_quote "$tag")
+    yaml_name=$(yaml_scalar "$tag")
     raw_address="${SERVER_IP#[}"
     raw_address="${raw_address%]}"
-    yaml_server=$(yaml_quote "$raw_address")
-    yaml_domain=$(yaml_quote "$domain")
-    yaml_public_key=$(yaml_quote "$public_key")
-    yaml_short_id=$(yaml_quote "$short_id")
-    yaml_uuid=$(yaml_quote "$uuid")
+    yaml_server=$(yaml_scalar "$raw_address")
+    yaml_domain=$(yaml_scalar "$domain")
+    yaml_public_key=$(yaml_scalar "$public_key")
+    yaml_short_id=$(yaml_scalar "$short_id")
+    yaml_uuid=$(yaml_scalar "$uuid")
     # support-x25519mlkem768 的拼写按用户指定；位置沿用原脚本 reality-opts。
     share_link="vless://${uuid}@${uri_address}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${encoded_domain}&fp=chrome&pbk=${encoded_public_key}&sid=${short_id}&type=tcp&headerType=none#${encoded_tag}"
     yaml_config="- {name: ${yaml_name}, type: vless, server: ${yaml_server}, port: ${port}, uuid: ${yaml_uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${yaml_domain}, client-fingerprint: chrome, reality-opts: {public-key: ${yaml_public_key}, short-id: ${yaml_short_id}, support-x25519mlkem768: true}}"
