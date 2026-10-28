@@ -221,6 +221,63 @@ check_tag_available() {
     fi
 }
 
+# --- 获取并选择最近的正式版本（菜单输出到 stderr，结果单独返回）---
+select_xray_version() {
+    local mode="${1:-install}" current_version="${2:-}" releases versions choice i version
+    info "正在获取 Xray 正式版本列表..." >&2
+    releases=$(curl -fsSL --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100") || {
+        error "获取 Xray 版本列表失败，请检查网络或 GitHub API 限额"
+        return 1
+    }
+    # 正式版按数字版本排序：安装取两个，升降级各取一个；降级只允许更早版本。
+    versions=$(printf '%s' "$releases" | jq -er --arg mode "$mode" --arg current "$current_version" '
+        if type != "array" then error("invalid release list") else . end
+        | map(select(.draft == false and .prerelease == false)
+            | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+        | unique_by(.tag_name)
+        | sort_by(.tag_name | ltrimstr("v") | split(".") | map(tonumber)) | reverse
+        | map(.tag_name | ltrimstr("v"))
+        | map(select(if $mode == "downgrade" then
+              (split(".") | map(tonumber)) < ($current | split(".") | map(tonumber))
+            elif $mode == "upgrade" then
+              (split(".") | map(tonumber)) > ($current | split(".") | map(tonumber))
+            else true end))
+        | .[:(if $mode == "install" then 2 else 1 end)]
+        | if length == 0 then empty else .[] end') || {
+        error "未找到可用的正式版本，或版本列表解析失败"
+        return 1
+    }
+    # 升级直接使用最新正式版，无需再显示版本选择菜单。
+    if [ "$mode" = upgrade ]; then
+        printf '%s\n' "$versions"
+        return 0
+    fi
+    local candidates=()
+    while IFS= read -r version; do
+        candidates+=("$version")
+    done <<< "$versions"
+    echo "可选 Xray 正式版本（由新到旧）：" >&2
+    for ((i=0; i<${#candidates[@]}; i++)); do
+        printf '%s) v%s\n' "$((i + 1))" "${candidates[i]}" >&2
+    done
+    echo "0) 取消" >&2
+    while true; do
+        read -r -p "请选择版本 [1-${#candidates[@]}，默认 1，0 取消]: " choice || return 1
+        choice=${choice:-1}
+        [ "$choice" = 0 ] && return 2
+        case "$choice" in
+            1|2)
+                if [ "$choice" -le "${#candidates[@]}" ]; then
+                    printf '%s\n' "${candidates[choice-1]}"
+                    return 0
+                fi
+                ;;
+        esac
+        error "无效的选择"
+    done
+}
+
 # --- Xray 自动安装函数 ---
 install_xray() {
     # 检查是否已安装
@@ -236,17 +293,9 @@ install_xray() {
     # 检查并安装依赖
     check_dependencies || return 1
     
-    # 获取最新版本号
-    info "获取 Xray 最新版本"
+    # 安装前从最近两个正式版本中选择，留空默认最新。
     local version
-    version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/^v//')
-    
-    if [ -z "$version" ] || [ "$version" = "null" ]; then
-        error "获取 Xray 版本号失败，请检查网络连接"
-        return 1
-    fi
-
-    info "最新版本: v${version}"
+    version=$(select_xray_version install) || return 1
     
     # 调用下载和安装函数
     download_and_install_xray "$version" || return 1
@@ -419,6 +468,17 @@ download_and_install_xray() {
 
 # --- 升级 Xray ---
 upgrade_xray() {
+    change_xray_version upgrade 升级
+}
+
+# --- 降级 Xray ---
+downgrade_xray() {
+    change_xray_version downgrade 降级
+}
+
+# 升降级共用备份、配置检查和失败回退流程。
+change_xray_version() {
+    local mode="$1" action="$2"
     info "正在检查 Xray 版本..."
     
     # 获取当前版本
@@ -427,39 +487,29 @@ upgrade_xray() {
         current_version=$("$XRAY_BINARY_PATH" version 2>/dev/null | head -n 1 | awk '{print $2}' | sed 's/^v//' || echo "")
     fi
     
-    if [ -z "$current_version" ]; then
+    if ! [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         error "无法获取版本，请先安装 Xray"
         return 1
     fi
     
     info "当前版本: v${current_version}"
     
-    # 获取最新版本
-    info "获取最新版本"
-    local latest_version
-    latest_version=$(curl -s --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name | sed 's/^v//')
-    
-    if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
-        error "获取最新版本失败，请检查网络连接"
+    local target_version selection_status
+    target_version=$(select_xray_version "$mode" "$current_version") || {
+        selection_status=$?
+        [ "$selection_status" -eq 2 ] && return 0
         return 1
-    fi
+    }
     
-    info "最新版本: v${latest_version}"
-    
-    # 比较版本
-    if [ "$current_version" = "$latest_version" ]; then
-        success "已是最新版本 v${current_version}"
-        return 0
-    fi
-    
-    # 确认升级
-    read -r -p "发现新版本 v${latest_version}，是否升级? [Y/n]: " confirm
+    # 确认升降级
+    local confirm restart_choice
+    read -r -p "确认${action}到 v${target_version}? [Y/n]: " confirm || return 1
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        info "已取消升级"
+        info "已取消${action}"
         return 0
     fi
     
-    info "开始升级 Xray 从 v${current_version} 到 v${latest_version} ..."
+    info "开始${action} Xray 从 v${current_version} 到 v${target_version} ..."
 
     local binary_backup service_was_active=false
     binary_backup=$(mktemp "${XRAY_BINARY_PATH}.backup.XXXXXX") || {
@@ -478,42 +528,60 @@ upgrade_xray() {
         if systemctl is-active --quiet xray 2>/dev/null; then
             service_was_active=true
             info "正在停止 Xray 服务..."
-            systemctl stop xray
+            systemctl stop xray || { error "停止 Xray 服务失败，已取消${action}"; return 1; }
         fi
     elif [ "$OS_TYPE" = "alpine" ]; then
         if rc-service xray status >/dev/null 2>&1; then
             service_was_active=true
             info "正在停止 Xray 服务..."
-            rc-service xray stop 2>/dev/null || true
+            rc-service xray stop || { error "停止 Xray 服务失败，已取消${action}"; return 1; }
         fi
     fi
     
-    # 下载并安装新版本
-    if ! download_and_install_xray "$latest_version"; then
-        install -m 755 "$binary_backup" "$XRAY_BINARY_PATH" || true
+    # 下载并安装所选版本
+    if ! download_and_install_xray "$target_version"; then
+        install -m 755 "$binary_backup" "$XRAY_BINARY_PATH" || {
+            error "恢复原版本失败，备份位于 $binary_backup"
+            # 恢复失败时保留备份，避免退出清理删除唯一副本。
+            TEMP_FILES=("${TEMP_FILES[@]/$binary_backup/}")
+            return 1
+        }
         if [ "$service_was_active" = true ]; then
             restart_xray || true
         fi
-        error "升级失败"
+        error "${action}失败，已恢复原版本"
+        return 1
+    fi
+
+    # 旧核心可能不认识新配置字段；验证失败时恢复二进制，配置保持原样。
+    if [ -f "$XRAY_CONFIG_PATH" ] && ! "$XRAY_BINARY_PATH" run -test -config "$XRAY_CONFIG_PATH"; then
+        error "目标版本无法通过现有配置检查，正在恢复原版本..."
+        install -m 755 "$binary_backup" "$XRAY_BINARY_PATH" || {
+            error "恢复原版本失败，备份位于 $binary_backup"
+            TEMP_FILES=("${TEMP_FILES[@]/$binary_backup/}")
+            return 1
+        }
+        [ "$service_was_active" = true ] && restart_xray
         return 1
     fi
 
     # 询问是否重启服务
-    read -r -p "是否重启 Xray 服务? [Y/n]: " restart_choice
+    read -r -p "是否重启 Xray 服务? [Y/n]: " restart_choice || restart_choice=""
     if [[ ! "$restart_choice" =~ ^[Nn]$ ]]; then
         if restart_xray; then
-            success "升级成功"
+            success "${action}成功"
         else
             error "新版本启动失败，正在恢复旧版本..."
             install -m 755 "$binary_backup" "$XRAY_BINARY_PATH" || {
-                error "恢复旧版本失败"
+                error "恢复原版本失败，备份位于 $binary_backup"
+                TEMP_FILES=("${TEMP_FILES[@]/$binary_backup/}")
                 return 1
             }
             restart_xray || true
             return 1
         fi
     else
-        success "Xray 已升级，但服务尚未重启"
+        success "Xray 已${action}，但服务尚未重启"
     fi
 }
 
@@ -2105,11 +2173,12 @@ manage_xray() {
         echo "3) 查看状态"
         echo "4) 更新 GeoIP&GeoSite"
         echo "5) 卸载 Xray"
+        echo "6) 降级 Xray"
         echo "0) 返回主菜单"
         echo
 
         local management_choice
-        read -r -p "请选择操作 [0-5]: " management_choice
+        read -r -p "请选择操作 [0-6]: " management_choice
 
         case "$management_choice" in
             1)
@@ -2126,6 +2195,9 @@ manage_xray() {
                 ;;
             5)
                 uninstall_xray
+                ;;
+            6)
+                downgrade_xray
                 ;;
             0)
                 return 0
