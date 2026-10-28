@@ -36,8 +36,16 @@ yaml_scalar() {
             return
             ;;
     esac
-    if [[ "$value" =~ ^[[:alnum:]_./+@=-]+$ ]] &&
-       [[ ! "$value" =~ ^[-?:@] ]] &&
+    # 中文、空格和名称中间的 | 可以原样输出，不按 ASCII 白名单限制。
+    local plain=true
+    case "$value" in
+        *','*|*'['*|*']'*|*'{'*|*'}'*|*':'*|*'#'*|*'"'*|*"'"*|*$'\n'*|*$'\r'*|*$'\t'*) plain=false ;;
+    esac
+    case "${value:0:1}" in
+        '-'|'?'|':'|','|'['|']'|'{'|'}'|'#'|'&'|'*'|'!'|'|'|'>'|"'"|'"'|'%'|'@'|'`') plain=false ;;
+    esac
+    if [ "$plain" = true ] &&
+       [[ ! "$value" =~ ^[[:space:]]|[[:space:]]$ ]] &&
        [[ ! "$value" =~ $number_pattern ]] &&
        [[ ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
         printf '%s' "$value"
@@ -237,6 +245,25 @@ check_tag_available() {
     fi
 }
 
+# --- 获取 GitHub 标记的最新正式版本，不提供版本选择 ---
+get_latest_xray_version() {
+    local release version
+    info "正在获取 Xray 最新正式版本..." >&2
+    release=$(curl -fsSL --max-time 30 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest") || {
+        error "获取最新正式版本失败，请检查网络或 GitHub API 限额"
+        return 1
+    }
+    version=$(printf '%s' "$release" | jq -er '
+        select(.draft == false and .prerelease == false)
+        | .tag_name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+        | ltrimstr("v")') || {
+        error "最新正式版本信息无效"
+        return 1
+    }
+    printf '%s\n' "$version"
+}
+
 # --- Xray 自动安装函数 ---
 install_xray() {
     # 检查是否已安装
@@ -252,8 +279,9 @@ install_xray() {
     # 检查并安装依赖
     check_dependencies || return 1
     
-    # 首次安装固定使用 26.3.27，不查询最新版本或提供版本选择。
-    local version="26.3.27"
+    # 首次安装直接使用 GitHub 标记的最新正式版本。
+    local version
+    version=$(get_latest_xray_version) || return 1
     
     # 调用下载和安装函数
     download_and_install_xray "$version" || return 1
@@ -422,6 +450,78 @@ download_and_install_xray() {
     success "Xray v${version} 已安装到 $XRAY_BINARY_PATH"
     
     return 0
+}
+
+# 升级失败时恢复原核心；恢复失败则保留备份，便于手动处理。
+rollback_xray_upgrade() {
+    local backup="$1" service_was_active="$2"
+    install -m 755 "$backup" "$XRAY_BINARY_PATH" || {
+        TEMP_FILES=("${TEMP_FILES[@]/$backup/}")
+        error "恢复原核心失败，备份保留在 $backup"
+        return 1
+    }
+    if [ "$service_was_active" = true ]; then
+        restart_xray || { error "原核心已恢复，但服务恢复失败"; return 1; }
+    fi
+}
+
+# --- 升级至最新正式版（已有服务在成功后自动恢复运行）---
+upgrade_xray() {
+    local current_version target_version confirm backup service_was_active=false
+    if [ ! -x "$XRAY_BINARY_PATH" ]; then
+        error "请先安装 Xray"
+        return 1
+    fi
+    current_version=$("$XRAY_BINARY_PATH" version 2>/dev/null | head -n 1 | awk '{print $2}' | sed 's/^v//')
+    if ! [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        error "无法识别当前核心版本"
+        return 1
+    fi
+    target_version=$(get_latest_xray_version) || return 1
+    info "当前版本: v${current_version}；最新正式版: v${target_version}"
+    if jq -en --arg current "$current_version" --arg target "$target_version" \
+        '($current | split(".") | map(tonumber)) >= ($target | split(".") | map(tonumber))' >/dev/null; then
+        success "当前已是最新正式版或更高版本，无需升级"
+        return 0
+    fi
+    read -r -p "确认升级到 v${target_version}? [Y/n]: " confirm || return 1
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消升级"
+        return 0
+    fi
+    backup=$(mktemp "${XRAY_BINARY_PATH}.backup.XXXXXX") || return 1
+    register_temp_file "$backup"
+    cp -p "$XRAY_BINARY_PATH" "$backup" || { error "备份核心失败"; return 1; }
+
+    if [ "$OS_TYPE" = debian ]; then
+        if systemctl is-active --quiet xray 2>/dev/null; then
+            service_was_active=true
+            systemctl stop xray || { error "停止服务失败，已取消升级"; return 1; }
+        fi
+    elif [ "$OS_TYPE" = alpine ]; then
+        if rc-service xray status >/dev/null 2>&1; then
+            service_was_active=true
+            rc-service xray stop || { error "停止服务失败，已取消升级"; return 1; }
+        fi
+    fi
+    if ! download_and_install_xray "$target_version"; then
+        rollback_xray_upgrade "$backup" "$service_was_active" || return 1
+        error "升级失败，已恢复原核心"
+        return 1
+    fi
+    # 配置检查通过后再恢复服务，防止不兼容配置导致持续启动失败。
+    if [ -f "$XRAY_CONFIG_PATH" ] && ! "$XRAY_BINARY_PATH" run -test -config "$XRAY_CONFIG_PATH"; then
+        rollback_xray_upgrade "$backup" "$service_was_active" || return 1
+        error "新核心配置检查失败，已恢复原核心"
+        return 1
+    fi
+    if [ "$service_was_active" = true ] && ! restart_xray; then
+        rollback_xray_upgrade "$backup" "$service_was_active" || return 1
+        error "新核心启动失败，已恢复原核心及服务"
+        return 1
+    fi
+    success "Xray 已升级到 v${target_version}"
+    if [ "$service_was_active" = false ]; then info "服务原先未运行，升级后保持停止"; fi
 }
 
 # --- 获取服务器地址（IP 或域名）---
@@ -2008,21 +2108,21 @@ add_node_menu() {
 manage_xray() {
     while true; do
         echo -e "\n${cyan}=== 管理 Xray ===${none}\n"
-        echo "1) 重启 Xray"
-        echo "2) 查看状态"
-        echo "3) 更新 GeoIP&GeoSite"
-        echo "4) 卸载 Xray"
+        echo "1) 升级 Xray（最新正式版）"
+        echo "2) 重启 Xray"
+        echo "3) 查看状态"
+        echo "4) 更新 GeoIP&GeoSite"
+        echo "5) 卸载 Xray"
         echo "0) 返回主菜单"
         echo
-
         local management_choice
-        read -r -p "请选择操作 [0-4]: " management_choice
-
+        read -r -p "请选择操作 [0-5]: " management_choice
         case "$management_choice" in
-            1) restart_xray ;;
-            2) show_status ;;
-            3) update_geo_data && restart_xray ;;
-            4) uninstall_xray ;;
+            1) upgrade_xray ;;
+            2) restart_xray ;;
+            3) show_status ;;
+            4) update_geo_data && restart_xray ;;
+            5) uninstall_xray ;;
             0) return 0 ;;
             *) error "无效的选择" ;;
         esac
