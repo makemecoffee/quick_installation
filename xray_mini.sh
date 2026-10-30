@@ -1364,7 +1364,7 @@ add_reality_node() {
     
     # 仅使用指定文档中的 VLESS 出站和 RealityObject 字段。
     local share_link="" yaml_config="" client_config
-    local encoded_tag encoded_domain encoded_public_key uri_address raw_address
+    local encoded_tag encoded_domain encoded_public_key encoded_authority uri_address raw_address
     local yaml_name yaml_server yaml_domain yaml_public_key yaml_short_id yaml_uuid
     encoded_tag=$(printf '%s' "$tag" | url_encode) || return 1
     encoded_domain=$(printf '%s' "$domain" | url_encode) || return 1
@@ -1378,8 +1378,16 @@ add_reality_node() {
     yaml_public_key=$(yaml_scalar "$public_key")
     yaml_short_id=$(yaml_scalar "$short_id")
     yaml_uuid=$(yaml_scalar "$uuid")
-    # support-x25519mlkem768 的拼写按用户指定；位置沿用原脚本 reality-opts。
-    share_link="vless://${uuid}@${uri_address}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${encoded_domain}&fp=chrome&pbk=${encoded_public_key}&sid=${short_id}&type=tcp&headerType=none#${encoded_tag}"
+    # 小火箭专用格式：只编码 auto:UUID@地址:端口，不编码协议头和查询参数。
+    # tls=1 配合 pbk/sid 表示 REALITY，xtls=2 表示 Vision；默认使用 TCP。
+    if ! encoded_authority=$(set -o pipefail; printf '%s' "auto:${uuid}@${uri_address}:${port}" | base64 | tr -d '\r\n'); then
+        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
+        error "生成 Shadowrocket Base64 URI 失败"
+        return 1
+    fi
+    # 此链接同时用于终端显示和 save_node_meta 的 share_link 字段。
+    share_link="vless://${encoded_authority}?remark=${encoded_tag}&tls=1&xtls=2&sni=${encoded_domain}&fp=chrome&pbk=${encoded_public_key}&sid=${short_id}"
+    # YAML 独立生成，继续明文保存；support-x25519mlkem768 位置沿用 reality-opts。
     yaml_config="- {name: ${yaml_name}, type: vless, server: ${yaml_server}, port: ${port}, uuid: ${yaml_uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${yaml_domain}, client-fingerprint: chrome, reality-opts: {public-key: ${yaml_public_key}, short-id: ${yaml_short_id}, support-x25519mlkem768: true}}"
     client_config=$(jq -n --arg tag "$tag" --arg address "${SERVER_IP#[}" \
         --arg port "$port" --arg uuid "$uuid" --arg domain "$domain" \
