@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# 脚本版本独立于 Xray 核心版本；每次发布脚本修改时递增此版本号。
+readonly SCRIPT_VERSION="1.0.0"
+
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
 readonly magenta='\e[95m' cyan='\e[96m' none='\e[0m'
@@ -2280,13 +2283,18 @@ install_global_command() {
     
     # 检查是否已安装
     if [ -f "$target" ] && [ -x "$target" ]; then
-        success "全局命令 xrm 已安装"
+        local installed_version
+        if installed_version=$(read_script_version "$target"); then
+            success "全局命令 xrm 已安装，脚本版本: v${installed_version}"
+        else
+            success "全局命令 xrm 已安装（旧版无版本号，可从菜单更新）"
+        fi
         return 0
     fi
     
     info "正在安装全局命令 xrm..."
     
-    local tmpfile
+    local tmpfile remote_version
     tmpfile=$(mktemp "${target}.tmp.XXXXXX") || {
         error "创建临时文件失败"
         return 1
@@ -2294,7 +2302,7 @@ install_global_command() {
     register_temp_file "$tmpfile"
 
     # 先下载并校验，成功后再替换目标文件
-    if ! curl -fsSL "$script_url" -o "$tmpfile"; then
+    if ! curl -fsSL --max-time 60 "$script_url" -o "$tmpfile"; then
         rm -f "$tmpfile"
         error "全局命令安装失败"
         return 1
@@ -2306,6 +2314,11 @@ install_global_command() {
         return 1
     fi
 
+    if ! remote_version=$(validate_script_candidate "$tmpfile"); then
+        rm -f "$tmpfile"
+        return 1
+    fi
+
     if ! chmod 755 "$tmpfile" || ! mv -f "$tmpfile" "$target"; then
         rm -f "$tmpfile"
         error "安装全局命令失败"
@@ -2313,17 +2326,62 @@ install_global_command() {
     fi
 
     rm -f "$tmpfile"
-    success "全局命令安装成功！"
+    success "全局命令安装成功，脚本版本: v${remote_version}"
     info "现在可以在任何目录使用 xrm 命令"
+}
+
+is_valid_script_version() {
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})$ ]]
+}
+
+# 只读取版本声明，不执行下载文件或旧脚本。
+read_script_version() {
+    local version
+    [ -f "$1" ] || return 1
+    version=$(sed -n 's/^readonly SCRIPT_VERSION="\([0-9.]*\)"[[:space:]]*$/\1/p' "$1") || return 1
+    is_valid_script_version "$version" || return 1
+    printf '%s\n' "$version"
+}
+
+# 输出 -1 / 0 / 1，分别表示左侧版本低于 / 等于 / 高于右侧版本。
+compare_script_versions() {
+    is_valid_script_version "$1" && is_valid_script_version "$2" || return 1
+    local -a left right
+    local index left_number right_number
+    IFS=. read -r -a left <<< "$1"
+    IFS=. read -r -a right <<< "$2"
+    for index in 0 1 2; do
+        left_number=$((10#${left[index]}))
+        right_number=$((10#${right[index]}))
+        if [ "$left_number" -lt "$right_number" ]; then printf '%s\n' -1; return 0; fi
+        if [ "$left_number" -gt "$right_number" ]; then printf '%s\n' 1; return 0; fi
+    done
+    printf '%s\n' 0
+}
+
+validate_script_candidate() {
+    bash -n "$1" || { error "下载的脚本语法检查失败，保留原脚本"; return 1; }
+    read_script_version "$1" || {
+        error "远端脚本缺少有效版本号，请确认 GitHub master 已发布带版本号的脚本"
+        return 1
+    }
 }
 
 # --- 更新全局脚本 ---
 update_script() {
     local target="/usr/local/bin/xrm"
     local script_url="https://raw.githubusercontent.com/makemecoffee/quick_installation/refs/heads/master/xray_mini.sh"
-    local tmpfile
+    local tmpfile current_version="" current_label="未安装" remote_version comparison
 
-    info "正在检查并更新全局命令 xrm..."
+    if [ -f "$target" ]; then
+        if current_version=$(read_script_version "$target"); then
+            current_label="v${current_version}"
+        else
+            current_label="旧版（无版本号）"
+        fi
+    fi
+    info "已安装脚本版本: $current_label"
+    info "正在检查 GitHub 上的脚本版本..."
 
     tmpfile=$(mktemp "${target}.tmp.XXXXXX") || {
         error "创建临时文件失败"
@@ -2331,7 +2389,7 @@ update_script() {
     }
     register_temp_file "$tmpfile"
 
-    if ! curl -fsSL "$script_url" -o "$tmpfile"; then
+    if ! curl -fsSL --max-time 60 "$script_url" -o "$tmpfile"; then
         rm -f "$tmpfile"
         error "下载脚本失败"
         return 1
@@ -2343,6 +2401,30 @@ update_script() {
         return 1
     fi
 
+    if ! remote_version=$(validate_script_candidate "$tmpfile"); then
+        rm -f "$tmpfile"
+        return 1
+    fi
+    info "远端脚本版本: v${remote_version}"
+    if [ -n "$current_version" ]; then
+        comparison=$(compare_script_versions "$current_version" "$remote_version") || { rm -f "$tmpfile"; return 1; }
+        if [ "$comparison" -eq 0 ]; then
+            rm -f "$tmpfile"
+            success "当前已是最新版本 v${current_version}，无需更新"
+            if [ "$SCRIPT_VERSION" != "$current_version" ]; then
+                info "当前会话仍为 v${SCRIPT_VERSION}，请退出后重新执行 xrm"
+            fi
+            return 0
+        elif [ "$comparison" -gt 0 ]; then
+            rm -f "$tmpfile"
+            info "已安装版本 v${current_version} 高于远端 v${remote_version}，保留已安装版本"
+            if [ "$SCRIPT_VERSION" != "$current_version" ]; then
+                info "当前会话仍为 v${SCRIPT_VERSION}，请退出后重新执行 xrm"
+            fi
+            return 0
+        fi
+    fi
+
     if ! chmod 755 "$tmpfile" || ! mv -f "$tmpfile" "$target"; then
         rm -f "$tmpfile"
         error "更新全局命令失败"
@@ -2350,13 +2432,14 @@ update_script() {
     fi
 
     rm -f "$tmpfile"
-    success "全局命令 xrm 更新成功！"
-    info "下次执行 xrm 时将使用最新脚本"
+    success "脚本更新成功: ${current_label} → v${remote_version}"
+    info "当前会话仍为 v${SCRIPT_VERSION}；请退出后重新执行 xrm，使用 v${remote_version}"
 }
 
 # --- 主菜单 ---
 show_menu() {
     echo -e "\n${cyan}=== Xray 快速安装脚本 ===${none}"
+    echo -e "${magenta}脚本版本: v${SCRIPT_VERSION}${none}"
     
     # 获取 Xray 版本并显示
     if [ -f "$XRAY_BINARY_PATH" ]; then
@@ -2391,6 +2474,12 @@ show_status() {
 
 # --- 主函数 ---
 main() {
+    case "${1:-}" in
+        --version|-v)
+            printf 'xrm %s\n' "$SCRIPT_VERSION"
+            return 0
+            ;;
+    esac
     umask 077
     trap cleanup_temp_files EXIT
     trap handle_interrupt INT TERM
