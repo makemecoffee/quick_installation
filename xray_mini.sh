@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 脚本版本独立于 Xray 核心版本；每次发布脚本修改时递增此版本号。
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
@@ -2971,6 +2971,41 @@ sync_ai_sniffing() {
     jq '.config' "$pair" > "$config" && jq '.metadata' "$pair" > "$metadata"
 }
 
+show_current_outbound() {
+    local query label=""
+    # 从实际配置的首出站读取；只有凭据完全匹配时才使用档案名称。
+    query='
+        def host:
+            tostring | ltrimstr("[") | rtrimstr("]") |
+            if contains(":") then "[" + . + "]" else . end;
+        .outbounds[0] as $out |
+        if $out == null then "未显式配置"
+        elif ($out.protocol == "freedom" or $out.protocol == "direct") then "直连"
+        elif $out.protocol == "shadowsocks" then
+            ($out.settings.address // $out.settings.servers[0].address) as $server |
+            ($out.settings.port // $out.settings.servers[0].port) as $port |
+            ($out.settings.method // $out.settings.servers[0].method // "未知加密") as $method |
+            ($out.settings.password // $out.settings.servers[0].password) as $password |
+            (($profiles[0] // []) | if type == "array" then . else [] end) as $stored |
+            [$stored[] | select(type == "object") |
+                select(.server == $server and (.port | tonumber?) == ($port | tonumber?) and
+                    (.method // "2022-blake3-aes-128-gcm") == $method and .password == $password) |
+                .name | select(type == "string" and length > 0)] as $names |
+            (if ($names | length) == 1 then $names[0]
+             elif ($method | startswith("2022-")) then "SS2022 出口" else "SS 出口" end) +
+            "（" + (($server // "未知地址") | host) + ":" + (($port // "?") | tostring) + "，" + $method + "）"
+        elif ($out.protocol == "blackhole" or $out.protocol == "block") then "阻断"
+        else "自定义出口 " + ($out.tag // "未命名") + "（" + ($out.protocol // "未知协议") + "）"
+        end | gsub("[\\r\\n\\t]"; " ")'
+    if [ -f "$OUTBOUND_PROFILES_FILE" ]; then
+        label=$(jq -r --slurpfile profiles "$OUTBOUND_PROFILES_FILE" "$query" "$XRAY_CONFIG_PATH" 2>/dev/null) || label=""
+    fi
+    if [ -z "$label" ]; then
+        label=$(jq -r --argjson profiles '[[]]' "$query" "$XRAY_CONFIG_PATH" 2>/dev/null) || label="无法读取配置"
+    fi
+    printf '当前出口：%s\n' "$label"
+}
+
 show_ai_routing_status() {
     local metadata mode name
     metadata=$(mktemp) || return 1
@@ -3235,6 +3270,8 @@ _delete_ss_profile() {
 change_outbound() {
     while true; do
         echo -e "\n${cyan}=== 出口管理 ===${none}\n"
+        show_current_outbound
+        show_ai_routing_status || printf '当前 AI 分流：无法读取状态\n'
         echo
         echo "1) 添加出口"
         echo "2) 查看出口"
