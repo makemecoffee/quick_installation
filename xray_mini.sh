@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 脚本版本独立于 Xray 核心版本；每次发布脚本修改时递增此版本号。
-readonly SCRIPT_VERSION="1.1.3"
+readonly SCRIPT_VERSION="1.2.0"
 
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
@@ -83,6 +83,9 @@ readonly NODES_META_FILE="/usr/local/etc/xray/nodes_meta.json"
 readonly OUTBOUND_PROFILES_FILE="/usr/local/etc/xray/outbound_profiles.json"
 readonly XRAY_GEO_DIR="/usr/local/share/xray"
 readonly XRAY_LOCK_PATH="/run/xrm.lock"
+readonly AI_OUTBOUND_TAG="xrm-ai"
+readonly AI_RULE_TAG="xrm-ai-route"
+readonly AI_GEOSITE="geosite:category-ai-!cn"
 
 acquire_xrm_lock() {
     command -v flock >/dev/null 2>&1 || { error "缺少 flock，请先安装依赖"; return 1; }
@@ -268,10 +271,15 @@ install_xrm_traps() {
 
 # 验证通过后才提交；备份保留到服务重启成功。元数据候选为空表示不修改。
 commit_xray_state() {
-    local candidate="$1" meta_candidate="${2:-}" yaml_candidate="${3:-}"
+    local candidate="$1" meta_candidate="${2:-}" yaml_candidate="${3:-}" assets="${4:-}"
     local config_backup meta_backup="" yaml_backup="" meta_existed=false yaml_existed=false
     local write_failed=false
-    validate_xray_config "$candidate" || return 1
+    if [ -z "$assets" ] && jq -e --arg tag "$AI_RULE_TAG" \
+        'any(.routing.rules[]?; .ruleTag == $tag)' "$candidate" >/dev/null; then
+        resolve_xray_asset_context || return 1
+        assets="$GEO_ASSET_PRIMARY"
+    fi
+    validate_xray_config "$candidate" "$assets" || return 1
     config_backup=$(mktemp "$(dirname "$XRAY_CONFIG_PATH")/.xrm-config-backup.XXXXXX") || return 1
     register_temp_file "$config_backup"
     cp -p "$XRAY_CONFIG_PATH" "$config_backup" || return 1
@@ -339,6 +347,7 @@ commit_new_node() {
         .nodes += [{tag:$tag, share_link:$link, yaml_config:$yaml,
                     client_config:$client, created_at:$time}]' "$meta_source") || return 1
     printf '%s\n' "$meta_json" > "$meta_candidate" || return 1
+    sync_ai_sniffing "$config_candidate" "$meta_candidate" || return 1
     if [ -f "$YAML_NODES_FILE" ]; then
         cat "$YAML_NODES_FILE" > "$yaml_candidate" || return 1
     fi
@@ -2858,6 +2867,265 @@ _apply_ss_outbound() {
     fi
 }
 
+# 选择页读取同一份快照；未保存任何出口时也可选择直连。
+write_profile_snapshot() {
+    local destination="$1"
+    if [ -f "$OUTBOUND_PROFILES_FILE" ]; then
+        jq -e 'select(type == "array")' "$OUTBOUND_PROFILES_FILE" > "$destination" || {
+            error "无法读取已保存出口，暂只显示内置选项；原档案保留，请检查后重试"
+            printf '[]\n' > "$destination" || return 1
+        }
+    else
+        printf '[]\n' > "$destination"
+    fi
+}
+
+load_selected_profile() {
+    local profile="$1" field encoded
+    local -a fields=()
+    if ! printf '%s' "$profile" | jq -e '
+        type == "object" and (.name | type == "string") and
+        (.server | type == "string") and (.password | type == "string") and
+        (.port | type == "number" or type == "string") and
+        ((.method // "2022-blake3-aes-128-gcm") | type == "string")' >/dev/null; then
+        error "出口配置记录无效"; return 1
+    fi
+    # Base64 传递字段，避免 jq 的文本换行转换或命令替换改变密码字节。
+    while IFS= read -r -d '' encoded; do
+        if IFS= read -r -d '' field < <(printf '%s' "$encoded" | base64 -d); then
+            error "出口字段包含 NUL 字节，未应用"
+            return 1
+        fi
+        fields+=("$field")
+    done < <(
+        printf '%s' "$profile" | jq -j '
+            [.name,.server,(.port | tostring),.password,(.method // "2022-blake3-aes-128-gcm")][] |
+            @base64,"\u0000"'
+    )
+    [ "${#fields[@]}" -eq 5 ] || { error "无法读取出口配置字段"; return 1; }
+    SELECTED_PROFILE_NAME="${fields[0]}"
+    SELECTED_PROFILE_SERVER="${fields[1]}"
+    SELECTED_PROFILE_PORT=$(normalize_decimal "${fields[2]}" 1 65535) || { error "无效的出口端口"; return 1; }
+    SELECTED_PROFILE_PASSWORD="${fields[3]}"
+    SELECTED_PROFILE_METHOD="${fields[4]}"
+    [ -n "$SELECTED_PROFILE_SERVER" ] || { error "出口服务器地址不能为空"; return 1; }
+    validate_ss_password "$SELECTED_PROFILE_METHOD" "$SELECTED_PROFILE_PASSWORD"
+}
+
+read_ai_metadata() {
+    local destination="$1"
+    if [ -f "$NODES_META_FILE" ]; then
+        cat "$NODES_META_FILE" > "$destination" || return 1
+    else
+        printf '{"nodes":[]}\n' > "$destination" || return 1
+    fi
+    if ! jq -e '
+        type == "object" and (.nodes | type == "array") and
+        (.xrm_ai_routing == null or (.xrm_ai_routing |
+            .version == 1 and (.mode == "follow" or .mode == "direct" or .mode == "profile") and
+            ((.outbound_owned // false) | type == "boolean") and
+            (.domain_strategy_before == null or (.domain_strategy_before | type == "string")) and
+            ((.sniffing_tags // []) | type == "array" and all(.[]; type == "string"))))
+        ' "$destination" >/dev/null; then
+        error "节点元数据或 AI 分流状态无效，未修改配置"
+        return 1
+    fi
+}
+
+# 只管理此前没有 sniffing 的脚本节点；恢复跟随时保留用户后续修改。
+sync_ai_sniffing() {
+    local config="$1" metadata="$2" pair
+    if ! jq -e '.xrm_ai_routing != null' "$metadata" >/dev/null; then return 0; fi
+    if ! jq -e '.xrm_ai_routing | .version == 1 and
+        (.mode == "follow" or .mode == "direct" or .mode == "profile")' "$metadata" >/dev/null; then
+        error "不支持当前 AI 分流元数据版本，未修改节点"
+        return 1
+    fi
+    pair=$(mktemp) || return 1
+    register_temp_file "$pair"
+    jq --slurpfile metadata "$metadata" '
+        {config: ., metadata: $metadata[0]} |
+        {enabled:true, routeOnly:true, destOverride:["http","tls","quic"]} as $sniff |
+        (.metadata.xrm_ai_routing.sniffing_tags // []) as $old |
+        if .metadata.xrm_ai_routing.mode == "follow" then
+            if (.config.inbounds | type) == "array" then
+                .config.inbounds |= map(.tag as $tag |
+                    if ($old | index($tag)) != null and .sniffing == $sniff
+                    then del(.sniffing) else . end)
+            else . end |
+            .metadata.xrm_ai_routing.sniffing_tags = []
+        else
+            [.metadata.nodes[]?.tag] as $managed |
+            [.config.inbounds[]? | .tag as $tag |
+                select(($managed | index($tag)) != null and
+                    (.protocol == "shadowsocks" or .protocol == "vless") and
+                    (has("sniffing") | not)) | .tag] as $added |
+            if (.config.inbounds | type) == "array" then
+                .config.inbounds |= map(.tag as $tag |
+                    if ($added | index($tag)) != null then .sniffing = $sniff else . end)
+            else . end |
+            [.config.inbounds[]?.tag] as $present |
+            .metadata.xrm_ai_routing.sniffing_tags =
+                ([$old[] | . as $tag | select(($present | index($tag)) != null)] + $added | unique)
+        end' "$config" > "$pair" || return 1
+    jq '.config' "$pair" > "$config" && jq '.metadata' "$pair" > "$metadata"
+}
+
+show_ai_routing_status() {
+    local metadata mode name
+    metadata=$(mktemp) || return 1
+    register_temp_file "$metadata"
+    read_ai_metadata "$metadata" || return 1
+    mode=$(jq -r '.xrm_ai_routing.mode // "follow"' "$metadata") || return 1
+    case "$mode" in
+        follow) info "当前 AI 分流：跟随选择出口" ;;
+        direct) info "当前 AI 分流：直连" ;;
+        profile)
+            name=$(jq -r '.xrm_ai_routing.profile_name // "已指定出口"' "$metadata") || return 1
+            printf '\n当前 AI 分流：%s\n\n' "$name" ;;
+    esac
+    rm -f "$metadata"
+}
+
+apply_ai_routing() {
+    with_xrm_lock _apply_ai_routing "$@"
+}
+
+_apply_ai_routing() {
+    local mode="$1" profile="${2:-}" metadata candidate owned=false outbound='null' name="" strategy_changed=false
+    case "$mode" in follow|direct|profile) ;; *) error "无效的 AI 分流模式"; return 1 ;; esac
+    metadata=$(mktemp) || return 1
+    register_temp_file "$metadata"
+    read_ai_metadata "$metadata" || return 1
+    if jq -e '.xrm_ai_routing.outbound_owned == true' "$metadata" >/dev/null; then owned=true; fi
+    # 未设置和已跟随均为无副作用操作，返回页面不会生成分流配置。
+    if [ "$mode" = follow ] &&
+        jq -e '(.xrm_ai_routing.mode // "follow") == "follow"' "$metadata" >/dev/null &&
+        ! jq -e --arg rule "$AI_RULE_TAG" 'any(.routing.rules[]?; .ruleTag == $rule)' "$XRAY_CONFIG_PATH" >/dev/null; then
+        success "AI 分流已跟随选择出口"
+        return 0
+    fi
+    if [ "$mode" = profile ]; then
+        load_selected_profile "$profile" || return 1
+        name="$SELECTED_PROFILE_NAME"
+        outbound=$(jq -n --arg tag "$AI_OUTBOUND_TAG" --arg server "$SELECTED_PROFILE_SERVER" \
+            --arg port "$SELECTED_PROFILE_PORT" --arg password "$SELECTED_PROFILE_PASSWORD" \
+            --arg method "$SELECTED_PROFILE_METHOD" '
+            {tag:$tag, protocol:"shadowsocks", settings:{address:$server, port:($port|tonumber),
+                method:$method, password:$password}}') || return 1
+    fi
+    candidate=$(mktemp) || return 1
+    register_temp_file "$candidate"
+    if ! jq --arg mode "$mode" --arg ai "$AI_OUTBOUND_TAG" --arg rule "$AI_RULE_TAG" \
+        --arg geosite "$AI_GEOSITE" --argjson owned "$owned" --argjson outbound "$outbound" \
+        --slurpfile metadata "$metadata" '
+        (.outbounds // []) as $outbounds |
+        (.routing.rules // []) as $all_rules |
+        if ((.routing.script // "") != "") then error("当前使用路由脚本，请手动配置 AI 分流")
+        elif any($outbounds[]; .tag == $ai) and ($owned | not) then
+            error("AI 专用标签已被自定义出站使用，未覆盖")
+        elif ($metadata[0].xrm_ai_routing == null) and any($all_rules[]; .ruleTag == $rule) then
+            error("AI 规则标签已被自定义路由使用，未覆盖")
+        elif ($outbounds[0].tag // "") == $ai then
+            error("AI 专用出口不能作为默认出口，请先选择普通出口")
+        elif $mode == "direct" and any($outbounds[]; .tag == "direct" and .protocol != "freedom") then
+            error("direct 标签已被非 freedom 出站使用")
+        else
+            .outbounds = (if ($outbounds | length) == 0 then [{tag:"direct",protocol:"freedom"}] else $outbounds end) |
+            if $mode == "profile" then
+                if any(.outbounds[]; .tag == $ai and .protocol != "shadowsocks") then
+                    error("AI 专用出站类型异常，未覆盖")
+                else
+                    ([.outbounds[] | select(.tag == $ai)] | .[0] // {}) as $previous |
+                    .outbounds = ([.outbounds[] | select(.tag != $ai)] + [$previous + $outbound])
+                end
+            elif $mode == "direct" and (any(.outbounds[]; .tag == "direct") | not) then
+                .outbounds += [{tag:"direct",protocol:"freedom"}]
+            else . end |
+            [$all_rules[] | select(.ruleTag != $rule)] as $rules |
+            if $mode == "follow" then
+                .routing.rules = $rules |
+                if .routing.domainStrategy == "IPOnDemand" and
+                    ($metadata[0].xrm_ai_routing.domain_strategy_before | type) == "string" then
+                    .routing.domainStrategy = $metadata[0].xrm_ai_routing.domain_strategy_before
+                else . end
+            else
+                [.outbounds[] | select(.protocol == "blackhole" or .protocol == "block") |
+                    .tag | select(type == "string" and length > 0)] as $deny |
+                ([$rules | to_entries[] | .value.outboundTag as $tag |
+                    select(($deny | index($tag)) == null) | .key] | .[0] // ($rules | length)) as $start |
+                if any($rules[$start:][]; .outboundTag as $tag | ($deny | index($tag)) != null) then
+                    error("请先将现有拦截规则放在普通路由规则之前，再启用 AI 分流")
+                else
+                    # IPIfNonMatch 会在域名规则命中后跳过 DNS/IP 第二轮；
+                    # 有前置 IP 拦截时先解析，确保 AI 也遵循相同保护。
+                    if ((.routing.domainStrategy // "AsIs") | ascii_downcase) == "ipifnonmatch" and
+                        any($rules[:$start][]; ((.ip // []) | length) > 0) then
+                        .routing.domainStrategy = "IPOnDemand"
+                    else . end |
+                    .routing.rules = ($rules[:$start] + [{type:"field", ruleTag:$rule,
+                        domain:[$geosite], outboundTag:(if $mode == "direct" then "direct" else $ai end)}] + $rules[$start:])
+                end
+            end
+        end' "$XRAY_CONFIG_PATH" > "$candidate"; then
+        error "AI 分流配置未应用"
+        return 1
+    fi
+    local meta_next
+    meta_next=$(mktemp) || return 1
+    register_temp_file "$meta_next"
+    if jq -e --slurpfile before "$XRAY_CONFIG_PATH" '
+        .routing.domainStrategy == "IPOnDemand" and .routing.domainStrategy != $before[0].routing.domainStrategy
+        ' "$candidate" >/dev/null; then strategy_changed=true; fi
+    jq --arg mode "$mode" --arg name "$name" --argjson owned "$owned" \
+        --argjson strategy_changed "$strategy_changed" --slurpfile before "$XRAY_CONFIG_PATH" '
+        .xrm_ai_routing = ((.xrm_ai_routing // {}) + {version:1,mode:$mode,
+            outbound_owned:($owned or $mode == "profile")}) |
+        if $mode == "follow" then del(.xrm_ai_routing.domain_strategy_before)
+        elif $strategy_changed then
+            .xrm_ai_routing.domain_strategy_before //= $before[0].routing.domainStrategy
+        else . end |
+        if $mode == "profile" then .xrm_ai_routing.profile_name = $name
+        else del(.xrm_ai_routing.profile_name) end' "$metadata" > "$meta_next" || return 1
+    sync_ai_sniffing "$candidate" "$meta_next" || return 1
+    resolve_xray_asset_context || return 1
+    commit_xray_state "$candidate" "$meta_next" "" "$GEO_ASSET_PRIMARY" || return 1
+    success "AI 分流设置已应用"
+    if [ "$mode" != follow ] && [ "$strategy_changed" = true ]; then
+        info "已启用按需域名解析，保持前置 IP 拦截优先；恢复跟随时自动还原"
+    fi
+    show_ai_routing_status
+}
+
+select_ai_outbound() {
+    local snapshot count choice index profile
+    echo -e "\n${cyan}=== AI 分流 ===${none}\n"
+    show_ai_routing_status || return 1
+    snapshot=$(mktemp) || return 1
+    register_temp_file "$snapshot"
+    write_profile_snapshot "$snapshot" || return 1
+    count=$(jq 'length' "$snapshot") || return 1
+    echo "1) 直连"
+    echo "2) 跟随选择出口（默认）"
+    jq -r 'to_entries[] | "\(.key + 3)) \(.value.name) - \(.value.server):\(.value.port)"' "$snapshot"
+    echo "0) 返回"
+    read -r -p "请选择 AI 出口 [0-$((count + 2))]: " choice || return 1
+    case "$choice" in
+        ''|0) return 0 ;;
+        1) apply_ai_routing direct; return $? ;;
+        2) apply_ai_routing follow; return $? ;;
+    esac
+    choice=$(normalize_decimal "$choice" 1 "$((count + 2))") || { error "无效的选择"; return 1; }
+    # 前两项也接受十进制前导零。
+    case "$choice" in
+        1) apply_ai_routing direct; return $? ;;
+        2) apply_ai_routing follow; return $? ;;
+    esac
+    index=$((choice - 3))
+    profile=$(jq -ce --argjson index "$index" '.[$index]' "$snapshot") || return 1
+    apply_ai_routing profile "$profile"
+}
+
 # --- 查看已保存的 SS / SS2022 配置 ---
 list_ss_profiles() {
     init_outbound_profiles || return 1
@@ -2879,46 +3147,28 @@ list_ss_profiles() {
 
 # --- 选择并应用已保存的配置 ---
 select_and_apply_profile() {
-    if ! list_ss_profiles; then
-        return 1
-    fi
-    
-    local count
-    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE") || return 1
-    
-    echo
-    local choice
-    read -r -p "请选择配置编号 [1-$count] (0 返回): " choice || return 1
-    
-    if [ "$choice" = "0" ]; then
-        return 0
-    fi
-    
-    if ! choice=$(normalize_decimal "$choice" 1 "$count"); then
+    local snapshot count choice index profile
+    echo -e "\n${cyan}=== 选择出口 ===${none}\n"
+    snapshot=$(mktemp) || return 1
+    register_temp_file "$snapshot"
+    write_profile_snapshot "$snapshot" || return 1
+    count=$(jq 'length' "$snapshot") || return 1
+    echo "1) 直连"
+    jq -r 'to_entries[] | "\(.key + 2)) \(.value.name) - \(.value.server):\(.value.port)"' "$snapshot"
+    echo "0) 返回"
+    read -r -p "请选择出口 [0-$((count + 1))]: " choice || return 1
+    case "$choice" in ''|0) return 0 ;; esac
+    if ! choice=$(normalize_decimal "$choice" 1 "$((count + 1))"); then
         error "无效的选择"
         return 1
     fi
-    
-    local index=$((10#$choice - 1))
-    local profile
-    profile=$(jq -ce --argjson index "$index" '.[$index] |
-        select(type == "object" and (.name | type == "string") and
-            (.server | type == "string") and (.password | type == "string") and
-            (.port | type == "string" or type == "number"))' "$OUTBOUND_PROFILES_FILE") || {
-        error "出口配置记录无效"
-        return 1
-    }
-    
-    local name server port password method
-    name=$(printf '%s' "$profile" | jq -r '.name')
-    server=$(printf '%s' "$profile" | jq -r '.server')
-    port=$(printf '%s' "$profile" | jq -r '.port')
-    password=$(printf '%s' "$profile" | jq -r '.password')
-    method=$(printf '%s' "$profile" | jq -r '.method // "2022-blake3-aes-128-gcm"')
-    
-    info "正在应用配置: $name"
-    
-    apply_ss_outbound "$server" "$port" "$password" "$method"
+    if [ "$choice" -eq 1 ]; then apply_direct_outbound; return $?; fi
+    index=$((choice - 2))
+    profile=$(jq -ce --argjson index "$index" '.[$index]' "$snapshot") || return 1
+    load_selected_profile "$profile" || return 1
+    printf '\n正在应用出口：%s\n' "$SELECTED_PROFILE_NAME"
+    apply_ss_outbound "$SELECTED_PROFILE_SERVER" "$SELECTED_PROFILE_PORT" \
+        "$SELECTED_PROFILE_PASSWORD" "$SELECTED_PROFILE_METHOD"
 }
 
 # --- 删除已保存的 SS / SS2022 配置 ---
@@ -2984,15 +3234,13 @@ _delete_ss_profile() {
 
 change_outbound() {
     while true; do
-        echo -e "\n${cyan}=== 修改出口配置 ===${none}\n"
+        echo -e "\n${cyan}=== 出口管理 ===${none}\n"
         echo
-        echo "1) 直连出口"
-        echo "=========================="
-        echo "2) 添加出口"
-        echo "3) 选择出口"
-        echo "=========================="
-        echo "4) 查看出口"
-        echo "5) 删除出口"
+        echo "1) 添加出口"
+        echo "2) 查看出口"
+        echo "3) 删除出口"
+        echo "4) 选择出口"
+        echo "5) AI 分流"
         echo "0) 返回主菜单"
         echo
 
@@ -3000,11 +3248,6 @@ change_outbound() {
 
         case "$outbound_choice" in
         1)
-            # 直连出口
-            info "正在配置直连出口..."
-            apply_direct_outbound || return 1
-            ;;
-        2)
             # 添加新的 SS / SS2022 出口
             info "添加 SS 出口"
             echo
@@ -3082,20 +3325,22 @@ change_outbound() {
 
             info "加密方法: $ss_method"
             if save_ss_profile "$ss_name" "$ss_server" "$ss_port" "$ss_password" "$ss_method"; then
-                info "配置已保存，请使用选项 3 选择并应用配置"
+                info "配置已保存，请使用选项 4 选择出口，或选项 5 设置 AI 分流"
             fi
             ;;
-        3)
-            # 选择已保存的配置
-            select_and_apply_profile
-            ;;
-        4)
+        2)
             # 查看已保存的配置
             list_ss_profiles
             ;;
-        5)
+        3)
             # 删除已保存的配置
             delete_ss_profile
+            ;;
+        4)
+            select_and_apply_profile
+            ;;
+        5)
+            select_ai_outbound
             ;;
         0)
             return 0
