@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 脚本版本独立于 Xray 核心版本；每次发布脚本修改时递增此版本号。
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
@@ -2971,6 +2971,10 @@ sync_ai_sniffing() {
     jq '.config' "$pair" > "$config" && jq '.metadata' "$pair" > "$metadata"
 }
 
+print_outbound_status() {
+    printf '%b%s%b\n' "$yellow" "$1" "$none"
+}
+
 show_current_outbound() {
     local query label=""
     # 从实际配置的首出站读取；只有凭据完全匹配时才使用档案名称。
@@ -3003,7 +3007,7 @@ show_current_outbound() {
     if [ -z "$label" ]; then
         label=$(jq -r --argjson profiles '[[]]' "$query" "$XRAY_CONFIG_PATH" 2>/dev/null) || label="无法读取配置"
     fi
-    printf '当前出口：%s\n' "$label"
+    print_outbound_status "当前出口：$label"
 }
 
 show_ai_routing_status() {
@@ -3013,11 +3017,11 @@ show_ai_routing_status() {
     read_ai_metadata "$metadata" || return 1
     mode=$(jq -r '.xrm_ai_routing.mode // "follow"' "$metadata") || return 1
     case "$mode" in
-        follow) info "当前 AI 分流：跟随选择出口" ;;
-        direct) info "当前 AI 分流：直连" ;;
+        follow) print_outbound_status "当前 AI 分流：跟随选择出口" ;;
+        direct) print_outbound_status "当前 AI 分流：直连" ;;
         profile)
             name=$(jq -r '.xrm_ai_routing.profile_name // "已指定出口"' "$metadata") || return 1
-            printf '\n当前 AI 分流：%s\n\n' "$name" ;;
+            print_outbound_status "当前 AI 分流：$name" ;;
     esac
     rm -f "$metadata"
 }
@@ -3129,13 +3133,12 @@ _apply_ai_routing() {
     if [ "$mode" != follow ] && [ "$strategy_changed" = true ]; then
         info "已启用按需域名解析，保持前置 IP 拦截优先；恢复跟随时自动还原"
     fi
-    show_ai_routing_status
+    return 0
 }
 
 select_ai_outbound() {
     local snapshot count choice index profile
     echo -e "\n${cyan}=== AI 分流 ===${none}\n"
-    show_ai_routing_status || return 1
     snapshot=$(mktemp) || return 1
     register_temp_file "$snapshot"
     write_profile_snapshot "$snapshot" || return 1
@@ -3271,7 +3274,7 @@ change_outbound() {
     while true; do
         echo -e "\n${cyan}=== 出口管理 ===${none}\n"
         show_current_outbound
-        show_ai_routing_status || printf '当前 AI 分流：无法读取状态\n'
+        show_ai_routing_status || print_outbound_status "当前 AI 分流：无法读取状态"
         echo
         echo "1) 添加出口"
         echo "2) 查看出口"
