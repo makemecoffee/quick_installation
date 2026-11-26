@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 脚本版本独立于 Xray 核心版本；每次发布脚本修改时递增此版本号。
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.3"
 
 # --- 颜色定义 ---
 readonly red='\e[91m' green='\e[92m' yellow='\e[93m'
@@ -17,6 +17,8 @@ ACTIVE_TRANSACTION=()
 TRANSACTION_RESTARTING=false
 TRANSACTION_WAS_ACTIVE=false
 ACTIVE_GEO_TRANSACTION=()
+ACTIVE_XRAY_UPGRADE=()
+ACTIVE_GEO_SCHEDULE=()
 XRM_LOCK_HELD=false
 
 register_temp_file() {
@@ -141,7 +143,7 @@ atomic_replace_file() {
 }
 
 validate_xray_config() {
-    local candidate="$1" assets="${2:-}" check_dir check_file result=0
+    local candidate="$1" assets="${2:-}" binary="${3:-$XRAY_BINARY_PATH}" check_dir check_file result=0
     jq empty "$candidate" || { error "配置不是有效 JSON，未应用修改"; return 1; }
     # 新版 external loader 即使有 -format json 也会检查文件扩展名。
     # BusyBox mktemp 的模板必须以 XXXXXX 结尾，使用私有目录中的固定 .json 文件。
@@ -153,10 +155,10 @@ validate_xray_config() {
         env -u xray.location.confdir -u XRAY_LOCATION_CONFDIR \
             -u xray.mph.cache -u XRAY_MPH_CACHE \
             "xray.location.asset=$assets" "XRAY_LOCATION_ASSET=$assets" \
-            "$XRAY_BINARY_PATH" run -test -format json -config "$check_file" || result=$?
+            "$binary" run -test -format json -config "$check_file" || result=$?
     else
         env -u xray.location.confdir -u XRAY_LOCATION_CONFDIR \
-            "$XRAY_BINARY_PATH" run -test -format json -config "$check_file" || result=$?
+            "$binary" run -test -format json -config "$check_file" || result=$?
     fi
     if [ "$result" -ne 0 ]; then
         rm -rf -- "$check_dir"
@@ -178,12 +180,17 @@ xray_service_is_active() {
 
 stop_xray() {
     if [ "$OS_TYPE" = debian ]; then
-        systemctl stop xray 9>&-
+        systemctl stop xray 9>&- || { error "停止 Xray 服务失败"; return 1; }
     elif [ "$OS_TYPE" = alpine ]; then
-        rc-service xray stop 9>&-
+        rc-service xray stop 9>&- || { error "停止 Xray 服务失败"; return 1; }
     else
         return 1
     fi
+    if xray_service_is_active; then
+        error "Xray 服务仍在运行，停止操作未完成"
+        return 1
+    fi
+    return 0
 }
 
 restore_node_state() {
@@ -229,12 +236,34 @@ rollback_active_transaction() {
     fi
 }
 
-handle_interrupt() {
-    trap '' INT TERM
-    rollback_active_geo_update || true
-    rollback_active_transaction || true
+rollback_active_operations() {
+    local failed=0
+    rollback_active_geo_schedule || failed=1
+    rollback_active_geo_update || failed=1
+    rollback_active_transaction || failed=1
+    rollback_active_xray_upgrade || failed=1
+    return "$failed"
+}
+
+finish_xrm() {
+    local status="${1:-0}"
+    # 恢复期间忽略重复信号；EXIT 与信号共用同一恢复入口，防止仅清理备份。
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ! rollback_active_operations && [ "$status" -eq 0 ]; then status=1; fi
     cleanup_temp_files
-    exit 130
+    exit "$status"
+}
+
+handle_interrupt() {
+    finish_xrm "${1:-130}"
+}
+
+install_xrm_traps() {
+    trap 'finish_xrm "$?"' EXIT
+    trap 'handle_interrupt 129' HUP
+    trap 'handle_interrupt 130' INT
+    trap 'handle_interrupt 143' TERM
 }
 
 # 验证通过后才提交；备份保留到服务重启成功。元数据候选为空表示不修改。
@@ -540,10 +569,13 @@ install_xray() {
         download_and_install_xray "$version" || return 1
     fi
 
-    # 保留已有 Geo 数据；只有缺失或为空时才联网补齐。
+    # 默认位置缺失时先确认实际加载位置，避免打开菜单就刷新自定义目录的数据。
     if [ ! -s /usr/local/share/xray/geoip.dat ] || \
        [ ! -s /usr/local/share/xray/geosite.dat ]; then
-        update_geo_data || return 1
+        resolve_xray_geo_targets || return 1
+        if [ ! -s "$GEO_IP_PATH" ] || [ ! -s "$GEO_SITE_PATH" ]; then
+            update_geo_data || return 1
+        fi
     fi
     
     # 创建函数会保留已有服务，避免覆盖用户自定义运行参数和用户。
@@ -565,6 +597,274 @@ fetch_geo_release() {
     curl -fsSL --max-time 30 https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest
 }
 
+# Xray 按“变量是否存在”选择资产目录；空值代表进程工作目录。
+geo_context_error() {
+    error "无法确认 Xray Geo 加载目录：$1。请先使用直接启动的 Xray 服务，或检查其资产目录配置"
+    return 1
+}
+
+geo_context_absolute() {
+    local path="$1" cwd="$2" component
+    local -a components=() parts=()
+    case "$path$cwd" in *$'\n'*|*$'\r'*) return 1 ;; esac
+    [[ "$path" = /* ]] || path="$cwd/$path"
+    IFS=/ read -r -a parts <<< "$path"
+    for component in "${parts[@]}"; do
+        case "$component" in
+            ''|.) ;;
+            ..) [ "${#components[@]}" -eq 0 ] || unset 'components[-1]' ;;
+            *) components+=("$component") ;;
+        esac
+    done
+    local IFS=/
+    printf '/%s\n' "${components[*]}"
+}
+
+# 只拆分 systemctl 的静态引号，不执行变量展开、命令替换或 shell 代码。
+geo_context_words() {
+    local text="$1" word="" quote="" char next active=false i
+    GEO_CONTEXT_WORDS=()
+    for ((i=0; i<${#text}; i++)); do
+        char="${text:i:1}"
+        if [ "$char" = '\' ] && [ "$quote" != "'" ]; then
+            i=$((i + 1))
+            [ "$i" -lt "${#text}" ] || return 1
+            next="${text:i:1}"
+            case "$next" in ' '|$'\t'|'\'|'"'|"'") word+="$next" ;; *) return 1 ;; esac
+            active=true
+        elif [ -n "$quote" ]; then
+            if [ "$char" = "$quote" ]; then quote=""; else word+="$char"; fi
+        else
+            case "$char" in
+                "'"|'"') quote="$char"; active=true ;;
+                ' '|$'\t')
+                    if [ "$active" = true ]; then GEO_CONTEXT_WORDS+=("$word"); word=""; active=false; fi ;;
+                $'\n'|$'\r') return 1 ;;
+                *) word+="$char"; active=true ;;
+            esac
+        fi
+    done
+    [ -z "$quote" ] || return 1
+    if [ "$active" = true ]; then GEO_CONTEXT_WORDS+=("$word"); fi
+}
+
+geo_context_process() {
+    local pid="$1" managed="$2" item dotted="" upper="" dotted_set=false upper_set=false root ns own_ns path entry check_entry host_inode view_inode
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { geo_context_error "服务主进程 PID 无效"; return 1; }
+    GEO_ASSET_BINARY=$(readlink -f "/proc/$pid/exe") || { geo_context_error "无法读取服务实际核心路径"; return 1; }
+    [ "$GEO_ASSET_BINARY" = "$managed" ] || { geo_context_error "服务主进程并非当前管理的核心"; return 1; }
+    GEO_ASSET_CWD=$(readlink -f "/proc/$pid/cwd") || { geo_context_error "无法读取服务实际工作目录"; return 1; }
+    root=$(readlink -f "/proc/$pid/root") || { geo_context_error "无法读取服务根目录"; return 1; }
+    ns=$(readlink "/proc/$pid/ns/mnt") || { geo_context_error "无法读取服务挂载命名空间"; return 1; }
+    own_ns=$(readlink /proc/self/ns/mnt) || { geo_context_error "无法读取当前挂载命名空间"; return 1; }
+    if [ "$root" != / ]; then
+        geo_context_error "服务使用独立根目录，无法保证文件映射一致"
+        return 1
+    fi
+    [ -r "/proc/$pid/environ" ] || { geo_context_error "无法读取服务进程环境"; return 1; }
+    while IFS= read -r -d '' item; do
+        case "$item" in
+            xray.location.asset=*) dotted_set=true; dotted="${item#*=}" ;;
+            XRAY_LOCATION_ASSET=*) upper_set=true; upper="${item#*=}" ;;
+        esac
+    done < "/proc/$pid/environ"
+    GEO_ASSET_EXPLICIT=true
+    if [ "$dotted_set" = true ]; then
+        GEO_ASSET_PRIMARY=$(geo_context_absolute "$dotted" "$GEO_ASSET_CWD") || return 1
+    elif [ "$upper_set" = true ]; then
+        GEO_ASSET_PRIMARY=$(geo_context_absolute "$upper" "$GEO_ASSET_CWD") || return 1
+    else
+        GEO_ASSET_EXPLICIT=false
+        GEO_ASSET_PRIMARY=$(dirname "$GEO_ASSET_BINARY")
+    fi
+    # PrivateTmp / ProtectSystem 可建立 namespace 而不改变 Geo 视图；
+    # 比较目录和两个数据文件的实际 inode，允许这种常见服务加固。
+    if [ "$ns" != "$own_ns" ]; then
+        for path in "$GEO_ASSET_PRIMARY" "$(dirname "$GEO_ASSET_BINARY")" "$XRAY_GEO_DIR" /usr/share/xray /opt/share/xray; do
+            for entry in "$path" "$path/geoip.dat" "$path/geosite.dat"; do
+                check_entry="$entry"
+                while true; do
+                    host_inode=$(stat -L -c '%d:%i' "$check_entry" 2>/dev/null) || host_inode=""
+                    view_inode=$(stat -L -c '%d:%i' "/proc/$pid/root$check_entry" 2>/dev/null) || view_inode=""
+                    if [ -n "$host_inode" ] || [ -n "$view_inode" ]; then
+                        if [ "$host_inode" != "$view_inode" ]; then
+                            geo_context_error "服务挂载命名空间改变了 Geo 文件视图"
+                            return 1
+                        fi
+                        break
+                    fi
+                    # 首次写入时目录可能尚不存在；确认最近已有祖先也共享，
+                    # 防止 host /tmp 新目录实际落在服务的 PrivateTmp 之外。
+                    if [ "$check_entry" = / ]; then
+                        geo_context_error "无法确认 Geo 目录已有祖先的文件映射"
+                        return 1
+                    fi
+                    check_entry="${check_entry%/*}"
+                    [ -n "$check_entry" ] || check_entry=/
+                done
+            done
+        done
+    fi
+}
+
+geo_context_systemd_property() {
+    systemctl show xray.service --property="$1" --value 2>/dev/null || {
+        geo_context_error "读取服务属性 $1 失败"; return 1;
+    }
+}
+
+geo_context_manager_safe() {
+    local unit_dotted="$1" unit_upper="$2" manager line
+    manager=$(systemctl show-environment 2>/dev/null) || {
+        geo_context_error "无法读取 systemd manager 环境"; return 1;
+    }
+    while IFS= read -r line; do
+        case "$line" in
+            xray.location.asset=*)
+                if [ "$unit_dotted" != true ]; then
+                    geo_context_error "manager 定义 dotted 资产环境，但停止的服务没有明确覆盖"; return 1
+                fi ;;
+            XRAY_LOCATION_ASSET=*)
+                if [ "$unit_dotted" != true ] && [ "$unit_upper" != true ]; then
+                    geo_context_error "manager 定义了资产环境，但停止的服务没有明确覆盖"; return 1
+                fi ;;
+        esac
+    done <<< "$manager"
+}
+
+geo_context_systemd() {
+    local managed="$1" load pid value property exec_start environment="" item asset="" dotted="" upper="" dotted_set=false upper_set=false
+    load=$(geo_context_systemd_property LoadState) || { geo_context_error "无法读取 systemd 服务配置"; return 1; }
+    if [ "$load" = not-found ]; then geo_context_manager_safe false false; return $?; fi
+    [ "$load" = loaded ] || { geo_context_error "systemd 服务未正确加载"; return 1; }
+    for property in RootDirectory RootImage BindPaths BindReadOnlyPaths TemporaryFileSystem MountImages ExtensionImages ExtensionDirectories; do
+        value=$(geo_context_systemd_property "$property") || return 1
+        [ -z "$value" ] || { geo_context_error "服务包含 $property 文件映射"; return 1; }
+    done
+    pid=$(geo_context_systemd_property MainPID) || return 1
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        geo_context_process "$pid" "$managed"
+        return $?
+    fi
+    if xray_service_is_active; then geo_context_error "运行服务没有可确认的主进程"; return 1; fi
+    for property in EnvironmentFiles PassEnvironment UnsetEnvironment PAMName; do
+        value=$(geo_context_systemd_property "$property") || return 1
+        [ -z "$value" ] || { geo_context_error "停止的服务包含 $property，需先启动后读取实际环境"; return 1; }
+    done
+    exec_start=$(geo_context_systemd_property ExecStart) || return 1
+    if [[ "$exec_start" =~ ^\{[[:space:]]path=([^[:space:]\;]+)[[:space:]]\; ]]; then
+        value="${BASH_REMATCH[1]}"
+    else
+        geo_context_error "停止的服务不是可确认的直接核心启动命令"
+        return 1
+    fi
+    value=$(readlink -f "$value") || { geo_context_error "无法解析服务 ExecStart 路径"; return 1; }
+    [ "$value" = "$managed" ] || { geo_context_error "服务 ExecStart 指向其他核心或包装程序"; return 1; }
+    GEO_ASSET_CWD=$(geo_context_systemd_property WorkingDirectory) || return 1
+    [ -n "$GEO_ASSET_CWD" ] || GEO_ASSET_CWD=/
+    [[ "$GEO_ASSET_CWD" = /* ]] || { geo_context_error "服务工作目录无法直接解析"; return 1; }
+    environment=$(geo_context_systemd_property Environment) || return 1
+    geo_context_words "$environment" || { geo_context_error "服务环境包含无法解析的转义"; return 1; }
+    for item in "${GEO_CONTEXT_WORDS[@]}"; do
+        case "$item" in
+            xray.location.asset=*) dotted="${item#*=}"; dotted_set=true ;;
+            XRAY_LOCATION_ASSET=*) upper="${item#*=}"; upper_set=true ;;
+        esac
+    done
+    # manager 环境可能由 DefaultEnvironment / PassEnvironment 等不同来源组成；
+    # 未被 unit 明确覆盖时不猜测它是否会传给下一次启动的进程。
+    geo_context_manager_safe "$dotted_set" "$upper_set" || return 1
+    if [ "$dotted_set" = true ]; then asset="$dotted"; else asset="$upper"; fi
+    if [ "$dotted_set" = true ] || [ "$upper_set" = true ]; then
+        case "$asset" in *'%'*) geo_context_error "服务资产目录包含延迟展开的 specifier"; return 1 ;; esac
+        GEO_ASSET_EXPLICIT=true
+        GEO_ASSET_PRIMARY=$(geo_context_absolute "$asset" "$GEO_ASSET_CWD") || return 1
+    fi
+    value=$(geo_context_systemd_property PrivateTmp) || return 1
+    case "$value" in
+        ''|no|false|0) ;;
+        *)
+            case "$GEO_ASSET_PRIMARY/" in /tmp/*|/var/tmp/*)
+                geo_context_error "停止的服务在独立临时目录内加载资产"; return 1 ;;
+            esac ;;
+    esac
+}
+
+geo_context_openrc_stopped() {
+    local path line actual expected
+    # OpenRC 配置是 shell；只接受本脚本生成的服务及静态、无资产覆盖的全局配置。
+    for path in /etc/conf.d/xray /etc/conf.d/xray.*; do
+        [ ! -f "$path" ] || ! grep -Eq '^[[:space:]]*[^#[:space:]]' "$path" || {
+            geo_context_error "停止的 OpenRC 服务有自定义 conf.d 配置"; return 1;
+        }
+    done
+    for path in /etc/rc.conf /etc/rc.conf.d/*.conf /etc/profile.env; do
+        [ -f "$path" ] || continue
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "${line//[[:space:]]/}" in ''|'#'*) continue ;; esac
+            if [[ "$line" == *XRAY_LOCATION_ASSET* || "$line" == *xray.location.asset* || "$line" == *rc_env_allow* ||
+                  "$line" == *'$'* || "$line" == *$'\x60'* || "$line" == *';'* ||
+                  "$line" == *'&'* || "$line" == *'|'* || "$line" == *'<'* || "$line" == *'>'* ||
+                  "$line" == *'('* || "$line" == *')'* || "$line" == *'\'* ]]; then
+                geo_context_error "停止的 OpenRC 服务存在动态或资产环境配置"
+                return 1
+            fi
+            geo_context_words "$line" || return 1
+            if [ "${GEO_CONTEXT_WORDS[0]:-}" = export ]; then GEO_CONTEXT_WORDS=("${GEO_CONTEXT_WORDS[@]:1}"); fi
+            [[ "${GEO_CONTEXT_WORDS[0]:-}" =~ ^[A-Za-z_][A-Za-z_0-9]*= ]] || return 1
+            if [ "${#GEO_CONTEXT_WORDS[@]}" -gt 1 ] && [[ "${GEO_CONTEXT_WORDS[1]}" != \#* ]]; then
+                geo_context_error "停止的 OpenRC 全局配置不是静态赋值"; return 1
+            fi
+        done < "$path"
+    done
+    [ -z "${RC_RUNLEVEL+x}${RC_PATH+x}" ] || { geo_context_error "当前 OpenRC 调用环境非默认"; return 1; }
+    actual=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' /etc/init.d/xray) || {
+        geo_context_error "无法读取 OpenRC 服务文件"; return 1;
+    }
+    expected=$(cat <<EOF
+name="Xray"
+description="Xray service"
+command="$XRAY_BINARY_PATH"
+command_args="run -config $XRAY_CONFIG_PATH"
+supervisor="supervise-daemon"
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+output_log="/var/log/xray/access.log"
+error_log="/var/log/xray/error.log"
+depend() {
+need net
+use dns logger
+}
+EOF
+)
+    [ "$actual" = "$expected" ] || { geo_context_error "停止的 OpenRC 服务已自定义，需先启动后读取实际环境"; return 1; }
+}
+
+resolve_xray_asset_context() {
+    local managed pid path count=0
+    managed=$(readlink -f "$XRAY_BINARY_PATH") || { geo_context_error "无法解析当前管理的核心路径"; return 1; }
+    GEO_ASSET_BINARY="$managed"
+    GEO_ASSET_CWD=/
+    GEO_ASSET_PRIMARY=$(dirname "$managed")
+    GEO_ASSET_EXPLICIT=false
+    if [ "$OS_TYPE" = debian ]; then
+        geo_context_systemd "$managed"
+    elif [ "$OS_TYPE" = alpine ]; then
+        if xray_service_is_active; then
+            for path in /proc/[0-9]*/exe; do
+                [ "$(readlink -f "$path" 2>/dev/null)" = "$managed" ] || continue
+                pid="${path%/exe}"; pid="${pid##*/}"; count=$((count + 1))
+            done
+            [ "$count" -eq 1 ] || { geo_context_error "无法唯一识别运行的 OpenRC 核心进程"; return 1; }
+            geo_context_process "$pid" "$managed"
+        elif [ -f /etc/init.d/xray ]; then
+            geo_context_openrc_stopped
+        fi
+    else
+        geo_context_error "不支持的服务管理方式"
+        return 1
+    fi
+}
+
 download_geo_asset() {
     local manifest="$1" name="$2" destination="$3" tag expected actual url
     tag=$(printf '%s' "$manifest" | jq -er '.tag_name | select(type == "string")') || return 1
@@ -581,11 +881,44 @@ download_geo_asset() {
     chmod 644 "$destination"
 }
 
+resolve_geo_asset_file() {
+    local name="$1" source path
+    for source in "$GEO_ASSET_PRIMARY" "$XRAY_GEO_DIR" /usr/share/xray /opt/share/xray; do
+        path="$source/$name"
+        if [ -e "$path" ]; then
+            [ -f "$path" ] || { error "Geo 路径不是普通文件: $path"; return 1; }
+            readlink -f "$path"
+            return $?
+        fi
+    done
+    # 全部缺失时，显式资产目录优先；默认安装继续使用原来的 share 目录。
+    if [ "$GEO_ASSET_EXPLICIT" = true ]; then source="$GEO_ASSET_PRIMARY"; else source="$XRAY_GEO_DIR"; fi
+    path="$source/$name"
+    if [ -L "$path" ]; then
+        readlink -f "$path" || { error "无法解析 Geo 软链接: $path"; return 1; }
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+resolve_xray_geo_targets() {
+    resolve_xray_asset_context || return 1
+    GEO_IP_PATH=$(resolve_geo_asset_file geoip.dat) || return 1
+    GEO_SITE_PATH=$(resolve_geo_asset_file geosite.dat) || return 1
+    if [ "$GEO_IP_PATH" = "$GEO_SITE_PATH" ]; then
+        error "GeoIP 与 GeoSite 指向同一文件，未更新"
+        return 1
+    fi
+}
+
 prepare_geo_overlay() {
     local candidate="$1" primary source entry name resolved
-    primary=$(printenv xray.location.asset 2>/dev/null || true)
-    [ -n "$primary" ] || primary="${XRAY_LOCATION_ASSET:-$(dirname "$XRAY_BINARY_PATH")}"
-    for source in "$primary" "$XRAY_GEO_DIR"; do
+    primary="${GEO_ASSET_PRIMARY:-}"
+    if [ -z "$primary" ]; then
+        primary=$(printenv xray.location.asset 2>/dev/null || true)
+        [ -n "$primary" ] || primary="${XRAY_LOCATION_ASSET:-$(dirname "$XRAY_BINARY_PATH")}"
+    fi
+    for source in "$primary" "$XRAY_GEO_DIR" /usr/share/xray /opt/share/xray; do
         [ -d "$source" ] || continue
         for entry in "$source"/*; do
             [ -e "$entry" ] || continue
@@ -618,15 +951,16 @@ rollback_active_geo_update() {
     local backup="${ACTIVE_GEO_TRANSACTION[0]}" had_ip="${ACTIVE_GEO_TRANSACTION[1]}"
     local had_site="${ACTIVE_GEO_TRANSACTION[2]}" was_active="${ACTIVE_GEO_TRANSACTION[3]}"
     local restarting="${ACTIVE_GEO_TRANSACTION[4]}" failed=0
+    local ip_path="${ACTIVE_GEO_TRANSACTION[5]}" site_path="${ACTIVE_GEO_TRANSACTION[6]}"
     if [ "$had_ip" = true ]; then
-        atomic_replace_file "$backup/geoip.dat" "$XRAY_GEO_DIR/geoip.dat" "$backup/geoip.dat" || failed=1
+        atomic_replace_file "$backup/geoip.dat" "$ip_path" "$backup/geoip.dat" || failed=1
     else
-        rm -f "$XRAY_GEO_DIR/geoip.dat" || failed=1
+        rm -f "$ip_path" || failed=1
     fi
     if [ "$had_site" = true ]; then
-        atomic_replace_file "$backup/geosite.dat" "$XRAY_GEO_DIR/geosite.dat" "$backup/geosite.dat" || failed=1
+        atomic_replace_file "$backup/geosite.dat" "$site_path" "$backup/geosite.dat" || failed=1
     else
-        rm -f "$XRAY_GEO_DIR/geosite.dat" || failed=1
+        rm -f "$site_path" || failed=1
     fi
     if [ "$failed" -eq 0 ] && [ "$restarting" = true ]; then
         if [ "$was_active" = true ]; then restart_xray || failed=1
@@ -641,33 +975,38 @@ rollback_active_geo_update() {
 }
 
 perform_geo_update() {
-    local candidate="$1" restart="$2" manifest backup had_ip=false had_site=false was_active=false
+    local candidate="$1" restart="$2" manifest backup had_ip=false had_site=false was_active=false path
     manifest=$(fetch_geo_release) || { error "获取 Geo 发布信息失败，保留旧数据"; return 1; }
     download_geo_asset "$manifest" geoip.dat "$candidate/geoip.dat" || return 1
     download_geo_asset "$manifest" geosite.dat "$candidate/geosite.dat" || return 1
-    if cmp -s "$candidate/geoip.dat" "$XRAY_GEO_DIR/geoip.dat" && \
-       cmp -s "$candidate/geosite.dat" "$XRAY_GEO_DIR/geosite.dat"; then
+    resolve_xray_geo_targets || return 1
+    local ip_path="$GEO_IP_PATH" site_path="$GEO_SITE_PATH"
+    if cmp -s "$candidate/geoip.dat" "$ip_path" && \
+       cmp -s "$candidate/geosite.dat" "$site_path"; then
         success "Geo 数据没有变化，无需更新或重启"
         return 0
     fi
     validate_geo_candidate "$candidate" || return 1
+    for path in "$ip_path" "$site_path"; do
+        if [ ! -d "$(dirname "$path")" ]; then install -d -m 755 "$(dirname "$path")" || return 1; fi
+    done
     backup=$(mktemp -d "$XRAY_GEO_DIR/.xrm-geo-backup.XXXXXX") || return 1
     register_temp_file "$backup"
-    if [ -e "$XRAY_GEO_DIR/geoip.dat" ]; then
+    if [ -e "$ip_path" ]; then
         had_ip=true
-        cp -p "$XRAY_GEO_DIR/geoip.dat" "$backup/geoip.dat" || return 1
+        cp -p "$ip_path" "$backup/geoip.dat" || return 1
     fi
-    if [ -e "$XRAY_GEO_DIR/geosite.dat" ]; then
+    if [ -e "$site_path" ]; then
         had_site=true
-        cp -p "$XRAY_GEO_DIR/geosite.dat" "$backup/geosite.dat" || return 1
+        cp -p "$site_path" "$backup/geosite.dat" || return 1
     fi
     if xray_service_is_active; then was_active=true; fi
-    ACTIVE_GEO_TRANSACTION=("$backup" "$had_ip" "$had_site" "$was_active" false)
+    ACTIVE_GEO_TRANSACTION=("$backup" "$had_ip" "$had_site" "$was_active" false "$ip_path" "$site_path")
     local ip_reference="$candidate/geoip.dat" site_reference="$candidate/geosite.dat"
-    [ "$had_ip" != true ] || ip_reference="$XRAY_GEO_DIR/geoip.dat"
-    [ "$had_site" != true ] || site_reference="$XRAY_GEO_DIR/geosite.dat"
-    if ! atomic_replace_file "$candidate/geoip.dat" "$XRAY_GEO_DIR/geoip.dat" "$ip_reference" || \
-       ! atomic_replace_file "$candidate/geosite.dat" "$XRAY_GEO_DIR/geosite.dat" "$site_reference"; then
+    [ "$had_ip" != true ] || ip_reference="$ip_path"
+    [ "$had_site" != true ] || site_reference="$site_path"
+    if ! atomic_replace_file "$candidate/geoip.dat" "$ip_path" "$ip_reference" || \
+       ! atomic_replace_file "$candidate/geosite.dat" "$site_path" "$site_reference"; then
         rollback_active_geo_update || return 1
         error "写入 Geo 数据失败，已恢复原数据"
         return 1
@@ -683,6 +1022,7 @@ perform_geo_update() {
     ACTIVE_GEO_TRANSACTION=()
     rm -rf -- "$backup"
     success "GeoIP / GeoSite 数据已校验并更新"
+    info "GeoIP: $ip_path\nGeoSite: $site_path"
 }
 
 _update_geo_data() {
@@ -704,9 +1044,9 @@ update_geo_data() {
     with_xrm_lock _update_geo_data "$@"
 }
 
-# --- 下载并安装 Xray 核心 ---
-download_and_install_xray() {
-    local version="$1"
+# 下载、校验并准备候选核心；此阶段不修改已安装核心或服务。
+prepare_xray_binary() {
+    local version="$1" destination="$2" binary_version
     
     # 检测架构
     local arch
@@ -780,33 +1120,60 @@ download_and_install_xray() {
         return 1
     fi
 
-    # 安装二进制文件
-    info "正在安装 Xray 到 $XRAY_BINARY_PATH ..."
-    install -m 755 "$tmpdir/xray" "$XRAY_BINARY_PATH" || {
-        error "安装二进制文件失败"
+    chmod 755 "$tmpdir/xray" || return 1
+    binary_version=$("$tmpdir/xray" version 2>/dev/null) || {
+        error "下载的核心无法执行，未替换现有核心"
+        return 1
+    }
+    binary_version=$(printf '%s\n' "$binary_version" | head -n 1 | awk '{print $2}' | sed 's/^v//')
+    if [ "$binary_version" != "$version" ]; then
+        error "下载的核心版本与目标 v${version} 不一致，未替换现有核心"
+        return 1
+    fi
+    install -m 755 "$tmpdir/xray" "$destination" || {
+        error "准备候选核心失败"
         rm -rf "$tmpdir"
         return 1
     }
-    
-    # 创建必要目录
-    mkdir -p /usr/local/etc/xray /usr/local/share/xray
-    
     rm -rf "$tmpdir"
-    success "Xray v${version} 已安装到 $XRAY_BINARY_PATH"
-    
-    return 0
 }
 
-# 升级失败时恢复原核心；恢复失败则保留备份，便于手动处理。
-rollback_xray_upgrade() {
-    local backup="$1" service_was_active="$2"
-    install -m 755 "$backup" "$XRAY_BINARY_PATH" || {
-        TEMP_FILES=("${TEMP_FILES[@]/$backup/}")
-        error "恢复原核心失败，备份保留在 $backup"
+# --- 下载并安装 Xray 核心（初次安装入口）---
+download_and_install_xray() {
+    local version="$1" candidate binary_target="$XRAY_BINARY_PATH"
+    if [ -L "$binary_target" ]; then binary_target=$(readlink -f "$binary_target") || return 1; fi
+    mkdir -p "$(dirname "$binary_target")" /usr/local/etc/xray /usr/local/share/xray || return 1
+    candidate=$(mktemp "$(dirname "$binary_target")/.xrm-core-candidate.XXXXXX") || return 1
+    register_temp_file "$candidate"
+    prepare_xray_binary "$version" "$candidate" || return 1
+    info "正在安装 Xray 到 $XRAY_BINARY_PATH ..."
+    local reference="$candidate"
+    [ ! -e "$XRAY_BINARY_PATH" ] || reference="$XRAY_BINARY_PATH"
+    atomic_replace_file "$candidate" "$XRAY_BINARY_PATH" "$reference" || {
+        error "安装二进制文件失败"
         return 1
     }
-    if [ "$service_was_active" = true ]; then
-        restart_xray || { error "原核心已恢复，但服务恢复失败"; return 1; }
+    rm -f "$candidate"
+    success "Xray v${version} 已安装到 $XRAY_BINARY_PATH"
+}
+
+# 普通失败和退出信号共用恢复流程；登记状态先于停服与替换操作。
+rollback_active_xray_upgrade() {
+    [ "${#ACTIVE_XRAY_UPGRADE[@]}" -gt 0 ] || return 0
+    local backup="${ACTIVE_XRAY_UPGRADE[0]}" was_active="${ACTIVE_XRAY_UPGRADE[1]}"
+    local service_touched="${ACTIVE_XRAY_UPGRADE[2]}" binary_replaced="${ACTIVE_XRAY_UPGRADE[3]}" failed=0
+    if [ "$binary_replaced" = true ]; then
+        atomic_replace_file "$backup" "$XRAY_BINARY_PATH" "$backup" || failed=1
+    fi
+    if [ "$failed" -eq 0 ] && [ "$service_touched" = true ]; then
+        if [ "$was_active" = true ]; then restart_xray || failed=1
+        else stop_xray || failed=1; fi
+    fi
+    ACTIVE_XRAY_UPGRADE=()
+    if [ "$failed" -ne 0 ]; then
+        TEMP_FILES=("${TEMP_FILES[@]/$backup/}")
+        error "原核心或服务恢复未完成，备份保留在 $backup"
+        return 1
     fi
 }
 
@@ -816,7 +1183,7 @@ upgrade_xray() {
 }
 
 _upgrade_xray() {
-    local current_version target_version confirm backup service_was_active=false
+    local current_version target_version confirm backup candidate binary_target="$XRAY_BINARY_PATH" service_was_active=false
     if [ ! -x "$XRAY_BINARY_PATH" ]; then
         error "请先安装 Xray"
         return 1
@@ -838,37 +1205,42 @@ _upgrade_xray() {
         info "已取消升级"
         return 0
     fi
-    backup=$(mktemp "${XRAY_BINARY_PATH}.backup.XXXXXX") || return 1
+    # 与实际核心放在同一目录，保留 Xray 对可执行目录内资产的查找行为。
+    if [ -L "$binary_target" ]; then binary_target=$(readlink -f "$binary_target") || return 1; fi
+    candidate=$(mktemp "$(dirname "$binary_target")/.xrm-core-candidate.XXXXXX") || return 1
+    register_temp_file "$candidate"
+    prepare_xray_binary "$target_version" "$candidate" || return 1
+    if [ -f "$XRAY_CONFIG_PATH" ] && ! validate_xray_config "$XRAY_CONFIG_PATH" "" "$candidate"; then
+        error "新核心配置检查失败，现有核心和服务未修改"
+        return 1
+    fi
+    backup=$(mktemp "$(dirname "$binary_target")/.xrm-core-backup.XXXXXX") || return 1
     register_temp_file "$backup"
     cp -p "$XRAY_BINARY_PATH" "$backup" || { error "备份核心失败"; return 1; }
 
-    if [ "$OS_TYPE" = debian ]; then
-        if systemctl is-active --quiet xray 2>/dev/null; then
-            service_was_active=true
-            systemctl stop xray || { error "停止服务失败，已取消升级"; return 1; }
-        fi
-    elif [ "$OS_TYPE" = alpine ]; then
-        if rc-service xray status >/dev/null 2>&1; then
-            service_was_active=true
-            rc-service xray stop || { error "停止服务失败，已取消升级"; return 1; }
+    if xray_service_is_active; then service_was_active=true; fi
+    ACTIVE_XRAY_UPGRADE=("$backup" "$service_was_active" false false)
+    if [ "$service_was_active" = true ]; then
+        ACTIVE_XRAY_UPGRADE[2]=true
+        if ! stop_xray; then
+            rollback_active_xray_upgrade || return 1
+            error "停止服务失败，已取消升级并恢复原服务状态"
+            return 1
         fi
     fi
-    if ! download_and_install_xray "$target_version"; then
-        rollback_xray_upgrade "$backup" "$service_was_active" || return 1
+    ACTIVE_XRAY_UPGRADE[3]=true
+    if ! atomic_replace_file "$candidate" "$XRAY_BINARY_PATH" "$XRAY_BINARY_PATH"; then
+        rollback_active_xray_upgrade || return 1
         error "升级失败，已恢复原核心"
         return 1
     fi
-    # 配置检查通过后再恢复服务，防止不兼容配置导致持续启动失败。
-    if [ -f "$XRAY_CONFIG_PATH" ] && ! "$XRAY_BINARY_PATH" run -test -config "$XRAY_CONFIG_PATH"; then
-        rollback_xray_upgrade "$backup" "$service_was_active" || return 1
-        error "新核心配置检查失败，已恢复原核心"
-        return 1
-    fi
     if [ "$service_was_active" = true ] && ! restart_xray; then
-        rollback_xray_upgrade "$backup" "$service_was_active" || return 1
+        rollback_active_xray_upgrade || return 1
         error "新核心启动失败，已恢复原核心及服务"
         return 1
     fi
+    ACTIVE_XRAY_UPGRADE=()
+    rm -f "$backup" "$candidate"
     success "Xray 已升级到 v${target_version}"
     if [ "$service_was_active" = false ]; then info "服务原先未运行，升级后保持停止"; fi
 }
@@ -1085,6 +1457,116 @@ read_geo_root_crontab() {
     fi
 }
 
+# 调度备份同时保留链接本身和目标内容，关闭后也能恢复原来的 unit 布局。
+backup_geo_schedule_unit() {
+    local path="$1" backup="$2"
+    cp -pL "$path" "$backup" || return 1
+    if [ -L "$path" ]; then readlink "$path" > "$backup.link" || return 1; fi
+}
+
+restore_geo_schedule_unit() {
+    local backup="$1" path="$2" link
+    if [ -f "$backup" ]; then
+        if [ -f "$backup.link" ] && [ ! -L "$path" ]; then
+            link=$(cat "$backup.link") || return 1
+            ln -s "$link" "$path" || return 1
+        fi
+        atomic_replace_file "$backup" "$path" "$backup"
+    else
+        rm -f "$path"
+    fi
+}
+
+geo_crond_is_enabled() {
+    rc-update show default 2>/dev/null | grep -Eq '^[[:space:]]*crond[[:space:]]'
+}
+
+# 所有备份完成后登记；调用者必须在首次修改正式文件或服务状态之前调用。
+begin_geo_schedule_transaction() {
+    local work="$1" operation="$2" was_enabled=false was_active=false path name
+    if [ "$OS_TYPE" = debian ]; then
+        for name in service timer; do
+            path="/etc/systemd/system/xrm-geo-update.$name"
+            if { [ -e "$path" ] || [ -L "$path" ]; } && ! geo_schedule_file_owned "$path"; then
+                if [ "$operation" = enable ]; then
+                    error "存在同名非本脚本定时配置，未覆盖: $path"
+                    return 1
+                fi
+                continue
+            fi
+            if [ "$operation" = enable ] || geo_schedule_file_owned "$path"; then
+                : > "$work/manage.$name" || return 1
+                [ ! -f "$path" ] || backup_geo_schedule_unit "$path" "$work/old.$name" || return 1
+            fi
+        done
+        if [ -f "$work/manage.timer" ]; then
+            if systemctl is-enabled --quiet xrm-geo-update.timer 2>/dev/null; then was_enabled=true; fi
+            if systemctl is-active --quiet xrm-geo-update.timer 2>/dev/null; then was_active=true; fi
+        fi
+    elif [ "$OS_TYPE" = alpine ]; then
+        read_geo_root_crontab "$work/old.cron" || return 1
+        if geo_crond_is_enabled; then was_enabled=true; fi
+        if rc-service crond status >/dev/null 2>&1; then was_active=true; fi
+    else
+        error "不支持的操作系统: $OS_TYPE"
+        return 1
+    fi
+    ACTIVE_GEO_SCHEDULE=("$OS_TYPE" "$work" "$was_enabled" "$was_active" "$operation")
+}
+
+rollback_active_geo_schedule() {
+    [ "${#ACTIVE_GEO_SCHEDULE[@]}" -gt 0 ] || return 0
+    local platform="${ACTIVE_GEO_SCHEDULE[0]}" work="${ACTIVE_GEO_SCHEDULE[1]}"
+    local was_enabled="${ACTIVE_GEO_SCHEDULE[2]}" was_active="${ACTIVE_GEO_SCHEDULE[3]}"
+    local operation="${ACTIVE_GEO_SCHEDULE[4]}" failed=0 name
+    if [ "$platform" = debian ]; then
+        for name in service timer; do
+            if [ -f "$work/manage.$name" ]; then
+                restore_geo_schedule_unit "$work/old.$name" "/etc/systemd/system/xrm-geo-update.$name" || failed=1
+            fi
+        done
+        if [ -f "$work/manage.service" ] || [ -f "$work/manage.timer" ]; then
+            systemctl daemon-reload || failed=1
+        fi
+        if [ -f "$work/manage.timer" ]; then
+            if [ "$was_enabled" = true ]; then
+                systemctl enable xrm-geo-update.timer || failed=1
+            elif ! systemctl disable xrm-geo-update.timer >/dev/null 2>&1; then
+                # 首次启用失败后 unit 可能已移除；确认未启用即可。
+                if systemctl is-enabled --quiet xrm-geo-update.timer 2>/dev/null; then failed=1; fi
+            fi
+            if [ "$was_active" = true ]; then
+                systemctl restart xrm-geo-update.timer || failed=1
+            elif ! systemctl stop xrm-geo-update.timer >/dev/null 2>&1; then
+                if systemctl is-active --quiet xrm-geo-update.timer 2>/dev/null; then failed=1; fi
+            fi
+        fi
+    elif [ "$platform" = alpine ]; then
+        crontab -u root "$work/old.cron" || failed=1
+        # 关闭计划不管理共享的 crond；仅撤销启用计划期间的服务变更。
+        if [ "$operation" = enable ]; then
+            if [ "$was_enabled" = true ]; then
+                if ! geo_crond_is_enabled; then rc-update add crond default || failed=1; fi
+            elif geo_crond_is_enabled; then
+                rc-update del crond default || failed=1
+            fi
+            if [ "$was_active" = true ]; then
+                if ! rc-service crond status >/dev/null 2>&1; then rc-service crond start 9>&- || failed=1; fi
+            elif rc-service crond status >/dev/null 2>&1; then
+                rc-service crond stop 9>&- || failed=1
+            fi
+        fi
+    else
+        failed=1
+    fi
+    ACTIVE_GEO_SCHEDULE=()
+    if [ "$failed" -ne 0 ]; then
+        TEMP_FILES=("${TEMP_FILES[@]/$work/}")
+        error "原 Geo 定时任务恢复未完成，备份保留在 $work"
+        return 1
+    fi
+}
+
 enable_geo_schedule() {
     with_xrm_lock _enable_geo_schedule "$@"
 }
@@ -1111,19 +1593,8 @@ _enable_geo_schedule() {
     register_temp_file "$work"
     if [ "$OS_TYPE" = debian ]; then
         local service=/etc/systemd/system/xrm-geo-update.service
-        local timer=/etc/systemd/system/xrm-geo-update.timer path
-        local was_enabled=false was_active=false restore_failed=false
-        for path in "$service" "$timer"; do
-            if { [ -e "$path" ] || [ -L "$path" ]; } && ! geo_schedule_file_owned "$path"; then
-                error "存在同名非本脚本定时配置，未覆盖: $path"
-                return 1
-            fi
-        done
-        [ ! -f "$service" ] || cp -p "$service" "$work/old.service" || return 1
-        [ ! -f "$timer" ] || cp -p "$timer" "$work/old.timer" || return 1
-        if systemctl is-enabled --quiet xrm-geo-update.timer; then was_enabled=true; fi
-        if systemctl is-active --quiet xrm-geo-update.timer; then was_active=true; fi
-        cat > "$work/new.service" <<'EOF'
+        local timer=/etc/systemd/system/xrm-geo-update.timer
+        cat > "$work/new.service" <<'EOF' || return 1
 # xrm-managed-geo-update
 [Unit]
 Description=Xray GeoIP and GeoSite update (xrm)
@@ -1136,7 +1607,7 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/local/bin/xrm --update-geo
 TimeoutStartSec=10min
 EOF
-        cat > "$work/new.timer" <<EOF
+        cat > "$work/new.timer" <<EOF || return 1
 # xrm-managed-geo-update
 [Unit]
 Description=Scheduled Xray GeoIP and GeoSite update (xrm)
@@ -1149,65 +1620,38 @@ Unit=xrm-geo-update.service
 [Install]
 WantedBy=timers.target
 EOF
+        begin_geo_schedule_transaction "$work" enable || return 1
         if ! atomic_replace_file "$work/new.service" "$service" || \
            ! atomic_replace_file "$work/new.timer" "$timer" || \
-           ! chmod 644 "$service" "$timer" || \
+           { [ ! -f "$work/old.service" ] && ! chmod 644 "$service"; } || \
+           { [ ! -f "$work/old.timer" ] && ! chmod 644 "$timer"; } || \
            ! systemctl daemon-reload || ! systemctl enable xrm-geo-update.timer || \
            ! systemctl restart xrm-geo-update.timer; then
-            if [ -f "$work/old.service" ]; then
-                atomic_replace_file "$work/old.service" "$service" "$work/old.service" || restore_failed=true
-            else
-                rm -f "$service" || restore_failed=true
-            fi
-            if [ -f "$work/old.timer" ]; then
-                atomic_replace_file "$work/old.timer" "$timer" "$work/old.timer" || restore_failed=true
-            else
-                rm -f "$timer" || restore_failed=true
-            fi
-            systemctl daemon-reload || restore_failed=true
-            if [ "$was_enabled" = true ]; then
-                systemctl enable xrm-geo-update.timer || restore_failed=true
-            else
-                systemctl disable xrm-geo-update.timer >/dev/null 2>&1 || true
-            fi
-            if [ "$was_active" = true ]; then
-                systemctl restart xrm-geo-update.timer || restore_failed=true
-            else
-                systemctl stop xrm-geo-update.timer >/dev/null 2>&1 || true
-            fi
-            if [ "$restore_failed" = true ]; then
-                TEMP_FILES=("${TEMP_FILES[@]/$work/}")
-                error "定时任务启用失败，原任务恢复未完成，备份保留在 $work"
-            else
-                error "定时任务启用失败，已恢复原任务配置"
-            fi
+            rollback_active_geo_schedule || return 1
+            error "定时任务启用失败，已恢复原任务配置"
             return 1
         fi
     elif [ "$OS_TYPE" = alpine ]; then
         command -v crontab >/dev/null 2>&1 || { error "未找到 crontab，请先安装 Alpine cron 服务"; return 1; }
-        local cron_was_active=false cron_was_enabled=false
-        if rc-service crond status >/dev/null 2>&1; then cron_was_active=true; fi
-        if rc-update show default 2>/dev/null | grep -Eq '^[[:space:]]*crond[[:space:]]'; then cron_was_enabled=true; fi
-        read_geo_root_crontab "$work/old.cron" || return 1
-        awk '$0 !~ / # xrm-managed-geo-update$/ {print}' "$work/old.cron" > "$work/new.cron" || return 1
-        printf '%s PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/local/bin/xrm --update-geo >> /var/log/xrm-geo-update.log 2>&1 # xrm-managed-geo-update\n' \
-            "$cron_time" >> "$work/new.cron" || return 1
-        crontab -u root "$work/new.cron" || { error "写入 root crontab 失败"; return 1; }
-        if ! rc-update add crond default || \
-           { [ "$cron_was_active" != true ] && ! rc-service crond start 9>&-; }; then
-            if ! crontab -u root "$work/old.cron"; then
-                TEMP_FILES=("${TEMP_FILES[@]/$work/}")
-                error "恢复原 root crontab 失败，备份保留在 $work/old.cron"
-            fi
-            if [ "$cron_was_active" = false ]; then rc-service crond stop 9>&- >/dev/null 2>&1 || true; fi
-            if [ "$cron_was_enabled" = false ]; then rc-update del crond default >/dev/null 2>&1 || true; fi
-            error "无法启用 crond，已取消本次定时任务设置"
+        begin_geo_schedule_transaction "$work" enable || return 1
+        if ! awk '$0 !~ / # xrm-managed-geo-update$/ {print}' "$work/old.cron" > "$work/new.cron" || \
+           ! printf '%s PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/local/bin/xrm --update-geo >> /var/log/xrm-geo-update.log 2>&1 # xrm-managed-geo-update\n' \
+            "$cron_time" >> "$work/new.cron"; then
+            rollback_active_geo_schedule || return 1
+            return 1
+        fi
+        if ! crontab -u root "$work/new.cron" || ! rc-update add crond default || \
+           { [ "${ACTIVE_GEO_SCHEDULE[3]}" != true ] && ! rc-service crond start 9>&-; }; then
+            rollback_active_geo_schedule || return 1
+            error "无法启用 Geo 定时任务，已恢复原任务配置"
             return 1
         fi
     else
         error "不支持的操作系统: $OS_TYPE"
         return 1
     fi
+    ACTIVE_GEO_SCHEDULE=()
+    rm -rf -- "$work"
     if [ "$frequency" = weekly ]; then
         success "已启用 Geo 每周更新：周日 04:00（服务器本地时区）"
     else
@@ -1220,36 +1664,44 @@ disable_geo_schedule() {
 }
 
 _disable_geo_schedule() {
+    local work changed=false failed=false
+    work=$(mktemp -d) || return 1
+    register_temp_file "$work"
     if [ "$OS_TYPE" = debian ]; then
         local service=/etc/systemd/system/xrm-geo-update.service
-        local timer=/etc/systemd/system/xrm-geo-update.timer changed=false
-        if geo_schedule_file_owned "$timer"; then
-            systemctl disable --now xrm-geo-update.timer || { error "停止 Geo 定时任务失败"; return 1; }
-            systemctl clean --what=state xrm-geo-update.timer >/dev/null 2>&1 || true
-            rm -f "$timer" || return 1
+        local timer=/etc/systemd/system/xrm-geo-update.timer
+        begin_geo_schedule_transaction "$work" disable || return 1
+        if [ -f "$work/manage.timer" ]; then
+            if ! systemctl disable --now xrm-geo-update.timer || ! rm -f "$timer"; then failed=true; fi
             changed=true
         fi
-        if geo_schedule_file_owned "$service"; then
-            systemctl stop xrm-geo-update.service || { error "停止 Geo 更新任务失败"; return 1; }
-            rm -f "$service" || return 1
+        if [ "$failed" = false ] && [ -f "$work/manage.service" ]; then
+            if ! systemctl stop xrm-geo-update.service || ! rm -f "$service"; then failed=true; fi
             changed=true
         fi
-        if [ "$changed" = true ]; then systemctl daemon-reload || return 1; fi
+        if [ "$failed" = false ] && [ "$changed" = true ]; then
+            systemctl daemon-reload || failed=true
+        fi
     elif [ "$OS_TYPE" = alpine ]; then
         if command -v crontab >/dev/null 2>&1; then
-            local work
-            work=$(mktemp -d) || return 1
-            register_temp_file "$work"
-            read_geo_root_crontab "$work/old.cron" || return 1
-            awk '$0 !~ / # xrm-managed-geo-update$/ {print}' "$work/old.cron" > "$work/new.cron" || return 1
-            if ! cmp -s "$work/old.cron" "$work/new.cron"; then
-                crontab -u root "$work/new.cron" || { error "移除 Geo 定时任务失败"; return 1; }
+            begin_geo_schedule_transaction "$work" disable || return 1
+            if ! awk '$0 !~ / # xrm-managed-geo-update$/ {print}' "$work/old.cron" > "$work/new.cron"; then
+                failed=true
+            elif ! cmp -s "$work/old.cron" "$work/new.cron"; then
+                crontab -u root "$work/new.cron" || failed=true
             fi
         fi
     else
         error "不支持的操作系统: $OS_TYPE"
         return 1
     fi
+    if [ "$failed" = true ]; then
+        rollback_active_geo_schedule || return 1
+        error "关闭 Geo 定时任务失败，已恢复原任务配置"
+        return 1
+    fi
+    ACTIVE_GEO_SCHEDULE=()
+    rm -rf -- "$work"
     success "Geo 定时更新已关闭"
 }
 
@@ -1286,19 +1738,22 @@ show_geo_schedule() {
     fi
 }
 
-manage_geo_schedule() {
+manage_geo_data() {
     local choice
     while true; do
+        echo -e "\n${cyan}=== 更新 Geo 数据 ===${none}\n"
         show_geo_schedule || return 1
-        echo "1) 每周更新（周日 04:00，默认）"
-        echo "2) 每日更新（04:00）"
-        echo "3) 关闭定时更新"
+        echo "1) 手动更新"
+        echo "2) 每周更新（周日 04:00）"
+        echo "3) 每日更新（04:00）"
+        echo "4) 关闭自动更新"
         echo "0) 返回"
-        read -r -p "请选择操作 [0-3，默认: 1]: " choice || return 1
-        case "${choice:-1}" in
-            1) enable_geo_schedule weekly ;;
-            2) enable_geo_schedule daily ;;
-            3) disable_geo_schedule ;;
+        read -r -p "请选择操作 [0-4]: " choice || return 1
+        case "$choice" in
+            1) update_geo_data true ;;
+            2) enable_geo_schedule weekly ;;
+            3) enable_geo_schedule daily ;;
+            4) disable_geo_schedule ;;
             0) return 0 ;;
             *) error "无效的选择" ;;
         esac
@@ -1544,10 +1999,31 @@ validate_ss_password() {
     fi
 }
 
-# --- 解析 SS / SS2022 URI（兼容标准 Base64 和 SIP002 Base64URL 认证信息）---
+# URI 组件按百分号编码解码；+ 是密钥的一部分，不按表单规则变为空格。
+decode_uri_component() {
+    local encoded="$1" hex byte
+    URI_DECODED=""
+    while [ -n "$encoded" ]; do
+        if [[ "$encoded" == %* ]]; then
+            hex="${encoded:1:2}"
+            if ! [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]] || [ "$hex" = 00 ]; then
+                error "URI 包含无效的百分号编码或 NUL 字节"
+                return 1
+            fi
+            printf -v byte '%b' "\\x$hex"
+            URI_DECODED+="$byte"
+            encoded="${encoded:3}"
+        else
+            URI_DECODED+="${encoded:0:1}"
+            encoded="${encoded:1}"
+        fi
+    done
+}
+
+# --- 解析 SS / SS2022 URI（标准明文认证及旧 Base64 / Base64URL 链接）---
 parse_ss_uri() {
     local uri="$1"
-    local body encoded_credentials endpoint decoded_credentials
+    local body encoded_credentials endpoint decoded_credentials decoded_file
 
     URI_SERVER=""
     URI_PORT=""
@@ -1565,6 +2041,10 @@ parse_ss_uri() {
     esac
 
     body="${body%%#*}"
+    if [[ "$body" == *\?* ]]; then
+        error "暂不支持 SS URI 查询参数，请改用不含插件参数的链接或手动填写"
+        return 1
+    fi
     if [[ "$body" != *@* ]]; then
         error "无效的 SS URI，缺少服务器地址"
         return 1
@@ -1574,26 +2054,45 @@ parse_ss_uri() {
     endpoint="${body##*@}"
     endpoint="${endpoint%/}"
 
-    encoded_credentials=$(printf '%s' "$encoded_credentials" | tr '_-' '/+')
-    case $(( ${#encoded_credentials} % 4 )) in
-        0) ;;
-        2) encoded_credentials+="==" ;;
-        3) encoded_credentials+="=" ;;
-        *) error "URI 中的认证信息不是有效 Base64"; return 1 ;;
-    esac
-
-    if ! decoded_credentials=$(printf '%s' "$encoded_credentials" | base64 -d 2>/dev/null); then
-        error "URI 中的认证信息不是有效 Base64"
-        return 1
+    if [[ "$encoded_credentials" == *:* ]]; then
+        # SIP002 的 SS2022 使用 method:password，两部分分别进行百分号解码。
+        decode_uri_component "${encoded_credentials%%:*}" || return 1
+        URI_METHOD="$URI_DECODED"
+        decode_uri_component "${encoded_credentials#*:}" || return 1
+        URI_PASSWORD="$URI_DECODED"
+    else
+        encoded_credentials=$(printf '%s' "$encoded_credentials" | tr '_-' '/+')
+        if ! [[ "$encoded_credentials" =~ ^[A-Za-z0-9+/]+={0,2}$ ]]; then
+            error "URI 中的认证信息不是有效 Base64"
+            return 1
+        fi
+        case $(( ${#encoded_credentials} % 4 )) in
+            0) ;;
+            2) encoded_credentials+="==" ;;
+            3) encoded_credentials+="=" ;;
+            *) error "URI 中的认证信息不是有效 Base64"; return 1 ;;
+        esac
+        decoded_file=$(mktemp) || return 1
+        register_temp_file "$decoded_file"
+        if ! printf '%s' "$encoded_credentials" | base64 -d > "$decoded_file" 2>/dev/null; then
+            rm -f "$decoded_file"
+            error "URI 中的认证信息不是有效 Base64"
+            return 1
+        fi
+        # read 到 EOF 保留密码末尾换行；读到 NUL 则拒绝，避免 Bash 静默删除它。
+        if IFS= read -r -d '' decoded_credentials < "$decoded_file"; then
+            rm -f "$decoded_file"
+            error "URI 中的认证信息包含 NUL 字节"
+            return 1
+        fi
+        rm -f "$decoded_file"
+        if [[ "$decoded_credentials" != *:* ]]; then
+            error "URI 中的认证信息缺少加密方式或密码分隔符"
+            return 1
+        fi
+        URI_METHOD="${decoded_credentials%%:*}"
+        URI_PASSWORD="${decoded_credentials#*:}"
     fi
-
-    if [[ "$decoded_credentials" != *:* ]]; then
-        error "URI 中的认证信息缺少加密方式或密码分隔符"
-        return 1
-    fi
-
-    URI_METHOD="${decoded_credentials%%:*}"
-    URI_PASSWORD="${decoded_credentials#*:}"
 
     if [[ "$endpoint" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
         URI_SERVER="${BASH_REMATCH[1]}"
@@ -2081,37 +2580,36 @@ _uninstall_xray() {
         return 0
     fi
 
-    disable_geo_schedule || { error "清理 Geo 定时任务失败，已取消卸载"; return 1; }
-    
     info "开始卸载 Xray..."
+
+    # 先确认停服成功，再移除定时任务和安装文件。
+    if xray_service_is_active 2>/dev/null; then
+        info "正在停止 Xray 服务..."
+        stop_xray || { error "无法停止 Xray，已取消卸载"; return 1; }
+    fi
+    disable_geo_schedule || { error "清理 Geo 定时任务失败，已取消卸载"; return 1; }
     
     # 停止并删除系统服务
     if [ "$OS_TYPE" = "debian" ]; then
-        if systemctl is-active --quiet xray 2>/dev/null; then
-            info "正在停止 Xray 服务..."
-            systemctl stop xray
-        fi
-        
         if systemctl is-enabled --quiet xray 2>/dev/null; then
             info "正在禁用 Xray 服务..."
-            systemctl disable xray
+            systemctl disable xray || { error "禁用 Xray 服务失败，已取消卸载"; return 1; }
         fi
         
         if [ -f /etc/systemd/system/xray.service ]; then
             info "正在删除 systemd 服务文件..."
-            rm -f /etc/systemd/system/xray.service
-            systemctl daemon-reload
+            rm -f /etc/systemd/system/xray.service || { error "删除 systemd 服务文件失败，已取消卸载"; return 1; }
+            systemctl daemon-reload || { error "重新加载 systemd 失败，已取消卸载"; return 1; }
         fi
     elif [ "$OS_TYPE" = "alpine" ]; then
-        if rc-service xray status >/dev/null 2>&1; then
-            info "正在停止 Xray 服务..."
-            rc-service xray stop 2>/dev/null || true
-        fi
-        
         if [ -x /etc/init.d/xray ]; then
             info "正在删除 OpenRC 服务..."
-            rc-update del xray default 2>/dev/null || true
-            rm -f /etc/init.d/xray
+            local default_services
+            default_services=$(rc-update show default) || { error "读取 OpenRC 服务状态失败，已取消卸载"; return 1; }
+            if printf '%s\n' "$default_services" | grep -Eq '^[[:space:]]*xray[[:space:]]'; then
+                rc-update del xray default || { error "禁用 OpenRC 服务失败，已取消卸载"; return 1; }
+            fi
+            rm -f /etc/init.d/xray || { error "删除 OpenRC 服务文件失败，已取消卸载"; return 1; }
         fi
         
         # 删除日志目录
@@ -2177,7 +2675,7 @@ restart_xray() {
     info "正在重启 Xray 服务..."
     
     if [ "$OS_TYPE" = "debian" ]; then
-        systemctl restart xray 9>&-
+        systemctl restart xray 9>&- || { error "重启 Xray 服务失败"; return 1; }
         sleep 2
         if systemctl is-active --quiet xray; then
             success "Xray 服务已重启"
@@ -2187,7 +2685,7 @@ restart_xray() {
             return 1
         fi
     elif [ "$OS_TYPE" = "alpine" ]; then
-        rc-service xray restart 9>&-
+        rc-service xray restart 9>&- || { error "重启 Xray 服务失败"; return 1; }
         sleep 2
         if rc-service xray status >/dev/null 2>&1; then
             success "Xray 服务已重启"
@@ -2195,7 +2693,11 @@ restart_xray() {
             error "Xray 服务启动失败，请检查配置"
             return 1
         fi
+    else
+        error "不支持的服务管理方式: $OS_TYPE"
+        return 1
     fi
+    return 0
 }
 
 # --- 修改出口配置 ---
@@ -2670,20 +3172,18 @@ manage_xray() {
         echo "1) 升级 Xray（最新正式版）"
         echo "2) 重启 Xray"
         echo "3) 查看状态"
-        echo "4) 更新 GeoIP&GeoSite"
+        echo "4) 更新 Geo 数据"
         echo "5) 卸载 Xray"
-        echo "6) 定时更新 Geo 数据"
         echo "0) 返回主菜单"
         echo
         local management_choice
-        read -r -p "请选择操作 [0-6]: " management_choice || return 1
+        read -r -p "请选择操作 [0-5]: " management_choice || return 1
         case "$management_choice" in
             1) upgrade_xray ;;
             2) restart_xray ;;
             3) show_status ;;
-            4) update_geo_data true ;;
+            4) manage_geo_data ;;
             5) uninstall_xray ;;
-            6) manage_geo_schedule ;;
             0) return 0 ;;
             *) error "无效的选择" ;;
         esac
@@ -2913,8 +3413,7 @@ main() {
             ;;
         --update-geo)
             umask 077
-            trap cleanup_temp_files EXIT
-            trap handle_interrupt INT TERM
+            install_xrm_traps
             check_root
             detect_os
             check_geo_update_dependencies || return 1
@@ -2923,8 +3422,7 @@ main() {
             ;;
     esac
     umask 077
-    trap cleanup_temp_files EXIT
-    trap handle_interrupt INT TERM
+    install_xrm_traps
 
     check_root
     detect_os

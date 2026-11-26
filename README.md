@@ -77,13 +77,21 @@ xrm --version
 
 ## Geo 数据更新
 
-手动更新请选择 **4）管理 Xray → 4）更新 GeoIP&GeoSite**。
+选择 **4）管理 Xray → 4）更新 Geo 数据**，查看当前自动更新状态并选择操作：
 
-定时更新请选择 **4）管理 Xray → 6）定时更新 Geo 数据**，可启用每周更新（默认每周日 04:00）或每天更新（每天 04:00），也可在该菜单查看当前设置或关闭。时间按服务器本地时区执行。
+- **1）手动更新**：立即检查并更新 Geo 数据。
+- **2）每周更新**：每周日 04:00 自动更新。
+- **3）每日更新**：每天 04:00 自动更新。
+- **4）关闭自动更新**：移除本脚本的定时任务。
+- **0）返回**：回到管理 Xray 菜单。
+
+定时更新按服务器本地时区执行。
 
 手动和定时更新都只在数据发生变化时应用更新。Xray 正在运行时会重启以加载新数据，连接会短暂中断；原先停止时保持停止。更新失败会保留或恢复原数据。
 
-请先更新全局命令到 `v1.1.0` 或更高版本，再开启定时任务。仅上传并运行新脚本时，全局命令仍可能是旧版；可用 `xrm --version` 确认。
+使用自定义 Geo 数据目录时，按 Xray 服务实际加载的位置更新，完成后显示两份数据的路径。无法确认自定义服务环境时会停止更新并提示原因；停止状态的复杂自定义服务可先启动 Xray 后重试。
+
+请先更新全局命令到 `v1.1.3` 或更高版本，以使用最新 Geo 更新功能。仅上传并运行新脚本时，全局命令仍可能是旧版；可用 `xrm --version` 确认。
 
 Debian / Ubuntu 使用 systemd 定时器，可通过 `journalctl -u xrm-geo-update.service -n 30 --no-pager` 查看执行日志。Alpine 使用 root 的 cron，日志在 `/var/log/xrm-geo-update.log`。关闭定时更新只移除本脚本的任务，不会关闭其他 cron 任务。
 
@@ -91,7 +99,7 @@ Debian / Ubuntu 使用 systemd 定时器，可通过 `journalctl -u xrm-geo-upda
 
 选择 **管理出口**，可切换直连，或通过 SS URI / 手动输入保存 SS 出口（支持上述两种传统 AEAD 和三种 SS2022），再选择并应用。切换出口会将所选出口置于出站列表首项，作为未命中路由时的默认出口；保留其他出站及已有路由规则。已有规则显式指定出口时，仍按该规则转发，不会随默认出口一起切换。
 
-添加出口后，需要再选择 **选择出口** 才会应用。若 URI 无法识别，可改用手动填写。
+添加出口后，需要再选择 **选择出口** 才会应用。支持标准 SS2022 的百分号编码认证信息，以及既有 Base64 / Base64URL 链接。若 URI 无法识别，可改用手动填写。
 
 脚本默认阻止访问私有 IP 和中国大陆 IP，分类依赖服务器上的 Geo 数据文件。
 
@@ -104,7 +112,7 @@ Debian / Ubuntu 使用 systemd 定时器，可通过 `journalctl -u xrm-geo-upda
 | Clash 节点 | `/usr/local/etc/xray/clash_nodes.yaml` |
 | 节点元数据 | `/usr/local/etc/xray/nodes_meta.json` |
 | SS 出口档案（含 SS2022） | `/usr/local/etc/xray/outbound_profiles.json` |
-| GeoIP / GeoSite | `/usr/local/share/xray/` |
+| GeoIP / GeoSite（默认） | `/usr/local/share/xray/` |
 | 管理命令 | `/usr/local/bin/xrm` |
 
 ## 服务管理
