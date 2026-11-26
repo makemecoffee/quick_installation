@@ -10,6 +10,9 @@ success() { echo -e "\n${green}$1${none}\n"; }
 # --- 全局变量 ---
 SERVER_IP=""
 TEMP_FILES=()
+ACTIVE_TRANSACTION=()
+TRANSACTION_RESTARTING=false
+TRANSACTION_WAS_ACTIVE=false
 
 register_temp_file() {
     TEMP_FILES+=("$1")
@@ -20,6 +23,7 @@ cleanup_temp_files() {
     for temp_file in "${TEMP_FILES[@]}"; do
         [ -e "$temp_file" ] && rm -rf -- "$temp_file"
     done
+    return 0
 }
 
 url_encode() {
@@ -70,6 +74,202 @@ readonly XRAY_BINARY_PATH="/usr/local/bin/xray"
 readonly YAML_NODES_FILE="/usr/local/etc/xray/clash_nodes.yaml"
 readonly NODES_META_FILE="/usr/local/etc/xray/nodes_meta.json"
 readonly OUTBOUND_PROFILES_FILE="/usr/local/etc/xray/outbound_profiles.json"
+
+# 限制位数后按十进制解析，避免整数溢出和前导零被按八进制解释。
+normalize_decimal() {
+    local value="$1" minimum="$2" maximum="$3"
+    [[ "$value" =~ ^[0-9]{1,18}$ ]] || return 1
+    value=$((10#$value))
+    [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] || return 1
+    printf '%s\n' "$value"
+}
+
+# 同目录替换，并沿用现有文件的属主/权限；保留已有配置软链接。
+atomic_replace_file() {
+    local source="$1" target="$2" reference="${3:-$2}" temp mode owner
+    if [ -L "$target" ]; then
+        target=$(readlink -f "$target") || return 1
+    fi
+    temp=$(mktemp "$(dirname "$target")/.xrm-write.XXXXXX") || return 1
+    register_temp_file "$temp"
+    if ! cat "$source" > "$temp"; then return 1; fi
+    if [ -e "$reference" ]; then
+        mode=$(stat -L -c '%a' "$reference") || return 1
+        owner=$(stat -L -c '%u:%g' "$reference") || return 1
+        chown "$owner" "$temp" && chmod "$mode" "$temp" || return 1
+    else
+        chmod 600 "$temp" || return 1
+    fi
+    mv -f "$temp" "$target"
+}
+
+validate_xray_config() {
+    local candidate="$1" check_dir check_file
+    jq empty "$candidate" || { error "配置不是有效 JSON，未应用修改"; return 1; }
+    # 新版 external loader 即使有 -format json 也会检查文件扩展名。
+    # BusyBox mktemp 的模板必须以 XXXXXX 结尾，使用私有目录中的固定 .json 文件。
+    check_dir=$(mktemp -d "${TMPDIR:-/tmp}/xrm-check.XXXXXX") || return 1
+    register_temp_file "$check_dir"
+    check_file="$check_dir/config.json"
+    (umask 077; cat "$candidate" > "$check_file") || return 1
+    env -u xray.location.confdir -u XRAY_LOCATION_CONFDIR \
+        "$XRAY_BINARY_PATH" run -test -format json -config "$check_file" || {
+        rm -rf -- "$check_dir"
+        error "Xray 配置预检失败，未应用修改"
+        return 1
+    }
+    rm -rf -- "$check_dir"
+}
+
+xray_service_is_active() {
+    if [ "$OS_TYPE" = debian ]; then
+        systemctl is-active --quiet xray
+    elif [ "$OS_TYPE" = alpine ]; then
+        rc-service xray status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+stop_xray() {
+    if [ "$OS_TYPE" = debian ]; then
+        systemctl stop xray
+    elif [ "$OS_TYPE" = alpine ]; then
+        rc-service xray stop
+    else
+        return 1
+    fi
+}
+
+restore_node_state() {
+    local config_backup="$1" meta_backup="$2" yaml_backup="$3"
+    local meta_existed="$4" yaml_existed="$5" failed=0 backup
+    atomic_replace_file "$config_backup" "$XRAY_CONFIG_PATH" "$config_backup" || failed=1
+    if [ "$meta_existed" = true ]; then
+        atomic_replace_file "$meta_backup" "$NODES_META_FILE" "$meta_backup" || failed=1
+    else
+        rm -f "$NODES_META_FILE" || failed=1
+    fi
+    if [ "$yaml_existed" = true ]; then
+        atomic_replace_file "$yaml_backup" "$YAML_NODES_FILE" "$yaml_backup" || failed=1
+    else
+        rm -f "$YAML_NODES_FILE" || failed=1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        # 恢复失败时，不能让退出清理删除仅存的旧状态。
+        for backup in "$config_backup" "$meta_backup" "$yaml_backup"; do
+            [ -n "$backup" ] || continue
+            TEMP_FILES=("${TEMP_FILES[@]/$backup/}")
+        done
+        error "恢复旧配置失败，备份保留在: $config_backup $meta_backup $yaml_backup"
+        return 1
+    fi
+}
+
+rollback_active_transaction() {
+    [ "${#ACTIVE_TRANSACTION[@]}" -gt 0 ] || return 0
+    local failed=0
+    restore_node_state "${ACTIVE_TRANSACTION[@]}" || failed=1
+    if [ "$failed" -eq 0 ] && [ "$TRANSACTION_RESTARTING" = true ]; then
+        if [ "$TRANSACTION_WAS_ACTIVE" = true ]; then
+            restart_xray || failed=1
+        else
+            stop_xray || failed=1
+        fi
+    fi
+    ACTIVE_TRANSACTION=()
+    if [ "$failed" -ne 0 ]; then
+        error "原状态恢复未完成，请检查日志及保留的备份"
+        return 1
+    fi
+}
+
+handle_interrupt() {
+    trap '' INT TERM
+    rollback_active_transaction || true
+    cleanup_temp_files
+    exit 130
+}
+
+# 验证通过后才提交；备份保留到服务重启成功。元数据候选为空表示不修改。
+commit_xray_state() {
+    local candidate="$1" meta_candidate="${2:-}" yaml_candidate="${3:-}"
+    local config_backup meta_backup="" yaml_backup="" meta_existed=false yaml_existed=false
+    local write_failed=false
+    validate_xray_config "$candidate" || return 1
+    config_backup=$(mktemp "$(dirname "$XRAY_CONFIG_PATH")/.xrm-config-backup.XXXXXX") || return 1
+    register_temp_file "$config_backup"
+    cp -p "$XRAY_CONFIG_PATH" "$config_backup" || return 1
+    if [ -f "$NODES_META_FILE" ]; then
+        meta_existed=true
+        meta_backup=$(mktemp "$(dirname "$NODES_META_FILE")/.xrm-meta-backup.XXXXXX") || return 1
+        register_temp_file "$meta_backup"
+        cp -p "$NODES_META_FILE" "$meta_backup" || return 1
+    fi
+    if [ -f "$YAML_NODES_FILE" ]; then
+        yaml_existed=true
+        yaml_backup=$(mktemp "$(dirname "$YAML_NODES_FILE")/.xrm-yaml-backup.XXXXXX") || return 1
+        register_temp_file "$yaml_backup"
+        cp -p "$YAML_NODES_FILE" "$yaml_backup" || return 1
+    fi
+    TRANSACTION_WAS_ACTIVE=false
+    if xray_service_is_active; then TRANSACTION_WAS_ACTIVE=true; fi
+    TRANSACTION_RESTARTING=false
+    ACTIVE_TRANSACTION=("$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed")
+    atomic_replace_file "$candidate" "$XRAY_CONFIG_PATH" || write_failed=true
+    if [ "$write_failed" = false ] && [ -n "$meta_candidate" ]; then
+        atomic_replace_file "$meta_candidate" "$NODES_META_FILE" || write_failed=true
+    fi
+    if [ "$write_failed" = false ] && [ -n "$yaml_candidate" ]; then
+        atomic_replace_file "$yaml_candidate" "$YAML_NODES_FILE" || write_failed=true
+    fi
+    if [ "$write_failed" = true ]; then
+        rollback_active_transaction || return 1
+        error "写入失败，已恢复原配置和节点文件"
+        return 1
+    fi
+    TRANSACTION_RESTARTING=true
+    if ! restart_xray; then
+        rollback_active_transaction || return 1
+        error "新配置启动失败，已恢复原配置和服务状态"
+        return 1
+    fi
+    ACTIVE_TRANSACTION=()
+    rm -f "$config_backup" "$meta_backup" "$yaml_backup"
+}
+
+commit_xray_config() {
+    commit_xray_state "$1"
+}
+
+# 先生成三个候选文件，生成失败不会留下半个节点。
+commit_new_node() {
+    local inbound="$1" tag="$2" link="$3" yaml="$4" client="$5"
+    local config_candidate meta_candidate yaml_candidate
+    config_candidate=$(mktemp) || return 1
+    register_temp_file "$config_candidate"
+    meta_candidate=$(mktemp) || return 1
+    register_temp_file "$meta_candidate"
+    yaml_candidate=$(mktemp) || return 1
+    register_temp_file "$yaml_candidate"
+    jq --argjson inbound "$inbound" '.inbounds += [$inbound]' "$XRAY_CONFIG_PATH" > "$config_candidate" || return 1
+    local meta_source="$NODES_META_FILE"
+    if [ ! -f "$meta_source" ]; then
+        printf '{"nodes":[]}' > "$meta_candidate" || return 1
+        meta_source="$meta_candidate"
+    fi
+    local meta_json
+    meta_json=$(jq --arg tag "$tag" --arg link "$link" --arg yaml "$yaml" \
+        --argjson client "$client" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .nodes += [{tag:$tag, share_link:$link, yaml_config:$yaml,
+                    client_config:$client, created_at:$time}]' "$meta_source") || return 1
+    printf '%s\n' "$meta_json" > "$meta_candidate" || return 1
+    if [ -f "$YAML_NODES_FILE" ]; then
+        cat "$YAML_NODES_FILE" > "$yaml_candidate" || return 1
+    fi
+    printf '%s\n' "$yaml" >> "$yaml_candidate" || return 1
+    commit_xray_state "$config_candidate" "$meta_candidate" "$yaml_candidate"
+}
 
 # --- 检查是否为 root 用户 ---
 check_root() {
@@ -187,7 +387,7 @@ verify_github_file_digest() {
 check_port_available() {
     local port="$1"
 
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    if ! port=$(normalize_decimal "$port" 1 65535); then
         error "无效端口: ${port} (应为 1-65535 的整数)"
         return 1
     fi
@@ -266,30 +466,37 @@ get_latest_xray_version() {
 
 # --- Xray 自动安装函数 ---
 install_xray() {
-    # 检查是否已安装
+    local current_version version
+    # 已有核心不自动升级；仍补齐未完成的安装步骤。
     if [ -f "$XRAY_BINARY_PATH" ]; then
-        local current_version
-        current_version=$("$XRAY_BINARY_PATH" version 2>/dev/null | head -n 1 | awk '{print $2}' || echo "未知")
+        if [ ! -x "$XRAY_BINARY_PATH" ] || \
+           ! current_version=$("$XRAY_BINARY_PATH" version 2>/dev/null); then
+            error "现有 Xray 核心无法执行，请检查文件或手动重新安装"
+            return 1
+        fi
+        current_version=$(printf '%s\n' "$current_version" | head -n 1 | awk '{print $2}')
+        if [ -z "$current_version" ]; then
+            error "现有 Xray 核心版本信息无效，请检查文件或手动重新安装"
+            return 1
+        fi
         success "Xray 已安装 (版本: ${current_version})"
-        return 0
+    else
+        info "未检测到 Xray，开始安装..."
+
+        check_dependencies || return 1
+
+        # 首次安装直接使用 GitHub 标记的最新正式版本。
+        version=$(get_latest_xray_version) || return 1
+        download_and_install_xray "$version" || return 1
     fi
 
-    info "未检测到 Xray，开始安装..."
+    # 保留已有 Geo 数据；只有缺失或为空时才联网补齐。
+    if [ ! -s /usr/local/share/xray/geoip.dat ] || \
+       [ ! -s /usr/local/share/xray/geosite.dat ]; then
+        update_geo_data || return 1
+    fi
     
-    # 检查并安装依赖
-    check_dependencies || return 1
-    
-    # 首次安装直接使用 GitHub 标记的最新正式版本。
-    local version
-    version=$(get_latest_xray_version) || return 1
-    
-    # 调用下载和安装函数
-    download_and_install_xray "$version" || return 1
-
-    # 下载基础 Geo 数据文件
-    update_geo_data || return 1
-    
-    # 创建系统服务
+    # 创建函数会保留已有服务，避免覆盖用户自定义运行参数和用户。
     create_service || return 1
     
     success "Xray 安装完成"
@@ -528,7 +735,7 @@ upgrade_xray() {
 get_server_address() {
     if [ -n "$SERVER_IP" ]; then
         # 如果已经设置过，询问是否继续使用
-        read -r -p "继续使用之前的地址 ($SERVER_IP)? [Y/n]: " reuse
+        read -r -p "继续使用之前的地址 ($SERVER_IP)? [Y/n]: " reuse || return 1
         if [[ ! "$reuse" =~ ^[Nn]$ ]]; then
             return 0
         fi
@@ -546,10 +753,10 @@ get_server_address() {
         info "检测到服务器 IP: $detected_ip"
     fi
     
-    read -r -p "使用 1)IP , 2)域名  [1/2]: " use_domain
+    read -r -p "使用 1)IP , 2)域名  [1/2]: " use_domain || return 1
     
     if [ "$use_domain" = "2" ]; then
-        read -r -p "请输入域名: " DOMAIN
+        read -r -p "请输入域名: " DOMAIN || return 1
         
         if [ -z "$DOMAIN" ]; then
             error "域名不能为空"
@@ -560,18 +767,18 @@ get_server_address() {
         success "使用域名: $SERVER_IP"
     else
         if [ -n "$detected_ip" ]; then
-            read -r -p "使用检测到的 IP ($detected_ip)? [Y/n]: " use_detected
+            read -r -p "使用检测到的 IP ($detected_ip)? [Y/n]: " use_detected || return 1
             if [[ ! "$use_detected" =~ ^[Nn]$ ]]; then
                 SERVER_IP="$detected_ip"
             else
-                read -r -p "请输入服务器 IP: " SERVER_IP
+                read -r -p "请输入服务器 IP: " SERVER_IP || return 1
                 if [ -z "$SERVER_IP" ]; then
                     error "IP 地址不能为空"
                     return 1
                 fi
             fi
         else
-            read -r -p "请输入服务器 IP: " SERVER_IP
+            read -r -p "请输入服务器 IP: " SERVER_IP || return 1
             if [ -z "$SERVER_IP" ]; then
                 error "IP 地址不能为空"
                 return 1
@@ -583,10 +790,10 @@ get_server_address() {
 
 # --- 选择使用 IP 还是域名 ---
 get_domain() {
-    read -r -p "使用 1)IP , 2)域名  [1/2]: " use_domain
+    read -r -p "使用 1)IP , 2)域名  [1/2]: " use_domain || return 1
     
     if [ "$use_domain" = "2" ]; then
-        read -r -p "请输入域名: " DOMAIN
+        read -r -p "请输入域名: " DOMAIN || return 1
         
         if [ -z "$DOMAIN" ]; then
             error "域名不能为空"
@@ -615,8 +822,14 @@ create_service() {
 
 # --- 创建 systemd 服务 ---
 create_systemd_service() {
-    if [ -f /etc/systemd/system/xray.service ]; then
+    if [ -f /etc/systemd/system/xray.service ] || [ -L /etc/systemd/system/xray.service ]; then
         success "systemd 服务已存在"
+        return 0
+    fi
+
+    # 发行版安装的 unit 可能位于 /lib、/usr/lib 或 /run；不创建覆盖它的 /etc unit。
+    if systemctl cat xray.service >/dev/null 2>&1; then
+        success "systemd 服务已存在，保留当前 unit 配置"
         return 0
     fi
 
@@ -715,51 +928,51 @@ EOF
 init_config() {
     # 检查配置文件是否已存在
     if [ -f "$XRAY_CONFIG_PATH" ]; then
-        success "配置文件已存在，跳过初始化: $XRAY_CONFIG_PATH"
-        return 0
-    fi
-    
-    info "正在创建初始配置文件..."
-    
-    mkdir -p "$(dirname "$XRAY_CONFIG_PATH")"
-    
-    jq -n '{
-        "log": {
-            "loglevel": "none"
-        },
-        "inbounds": [],
-        "outbounds": [
-            {
-                "tag": "direct",
-                "protocol": "freedom"
+        success "保留已有配置文件: $XRAY_CONFIG_PATH"
+    else
+        info "正在创建初始配置文件..."
+
+        mkdir -p "$(dirname "$XRAY_CONFIG_PATH")"
+
+        jq -n '{
+            "log": {
+                "loglevel": "none"
             },
-            {
-                "tag": "block",
-                "protocol": "blackhole"
-            }
-        ],
-        "routing": {
-            "domainStrategy": "IPIfNonMatch",
-            "rules": [
+            "inbounds": [],
+            "outbounds": [
                 {
-                    "ip": ["geoip:private"],
-                    "outboundTag": "block"
+                    "tag": "direct",
+                    "protocol": "freedom"
                 },
                 {
-                    "ip": ["geoip:cn"],
-                    "outboundTag": "block"
+                    "tag": "block",
+                    "protocol": "blackhole"
                 }
-            ]
-        }
-    }' > "$XRAY_CONFIG_PATH"
-    
-    if [ $? -eq 0 ]; then
-        success "配置文件已创建: $XRAY_CONFIG_PATH"
-    else
-        error "配置文件创建失败"
-        return 1
+            ],
+            "routing": {
+                "domainStrategy": "IPIfNonMatch",
+                "rules": [
+                    {
+                        "ip": ["geoip:private"],
+                        "outboundTag": "block"
+                    },
+                    {
+                        "ip": ["geoip:cn"],
+                        "outboundTag": "block"
+                    }
+                ]
+            }
+        }' > "$XRAY_CONFIG_PATH"
+
+        if [ $? -eq 0 ]; then
+            success "配置文件已创建: $XRAY_CONFIG_PATH"
+        else
+            error "配置文件创建失败"
+            return 1
+        fi
+
     fi
-    
+
     # 初始化 YAML 节点文件
     if [ ! -f "$YAML_NODES_FILE" ]; then
         cat > "$YAML_NODES_FILE" << 'EOF'
@@ -769,7 +982,7 @@ init_config() {
 EOF
         success "YAML 节点文件已创建: $YAML_NODES_FILE"
     fi
-    
+
     # 初始化节点元数据文件
     if [ ! -f "$NODES_META_FILE" ]; then
         echo '{"nodes":[]}' > "$NODES_META_FILE"
@@ -805,7 +1018,8 @@ ensure_routing_policy() {
                    "outboundTag": "block"
                }
            ]
-       }' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+       }' "$XRAY_CONFIG_PATH" > "$temp" &&
+        validate_xray_config "$temp" && atomic_replace_file "$temp" "$XRAY_CONFIG_PATH"
 
     if [ $? -eq 0 ]; then
         success "已初始化路由策略（禁止回国流量）"
@@ -848,7 +1062,7 @@ save_node_meta() {
            "yaml_config": $yaml,
            "client_config": $client,
            "created_at": $time
-       }]' "$NODES_META_FILE" > "$temp" && mv "$temp" "$NODES_META_FILE"
+       }]' "$NODES_META_FILE" > "$temp" && atomic_replace_file "$temp" "$NODES_META_FILE"
     
     if [ $? -eq 0 ]; then
         info "节点元数据已保存"
@@ -867,12 +1081,16 @@ generate_uuid() {
     }
 }
 
-# --- 生成 SS2022 密钥 ---
-generate_ss2022_key() {
+# --- 生成 SS 密码 / SS2022 密钥 ---
+generate_ss_password() {
     local method="$1"
     local key_length
 
     case "$method" in
+        aes-128-gcm|aes-256-gcm)
+            # 传统 SS 使用普通密码，无固定密钥长度要求；默认生成随机密码。
+            key_length=24
+            ;;
         2022-blake3-aes-128-gcm)
             key_length=16
             ;;
@@ -880,7 +1098,7 @@ generate_ss2022_key() {
             key_length=32
             ;;
         *)
-            error "不支持的 SS2022 加密方式: $method"
+            error "不支持的 SS 加密方式: $method"
             return 1
             ;;
     esac
@@ -892,13 +1110,20 @@ generate_ss2022_key() {
     fi
 }
 
-# --- 检查 SS2022 密码 ---
-validate_ss2022_password() {
+# --- 检查 SS 密码（传统 AEAD 接受普通非空密码，SS2022 校验预共享密钥）---
+validate_ss_password() {
     local method="$1"
     local password="$2"
     local key_length decoded_file decoded_length
 
     case "$method" in
+        aes-128-gcm|aes-256-gcm)
+            if [ -z "$password" ]; then
+                error "SS 密码不能为空"
+                return 1
+            fi
+            return 0
+            ;;
         2022-blake3-aes-128-gcm)
             key_length=16
             ;;
@@ -906,7 +1131,7 @@ validate_ss2022_password() {
             key_length=32
             ;;
         *)
-            error "不支持的 SS2022 加密方式: $method"
+            error "不支持的 SS 加密方式: $method"
             return 1
             ;;
     esac
@@ -938,8 +1163,8 @@ validate_ss2022_password() {
     fi
 }
 
-# --- 解析 SS2022 URI ---
-parse_ss2022_uri() {
+# --- 解析 SS / SS2022 URI（兼容标准 Base64 和 SIP002 Base64URL 认证信息）---
+parse_ss_uri() {
     local uri="$1"
     local body encoded_credentials endpoint decoded_credentials
 
@@ -953,22 +1178,36 @@ parse_ss2022_uri() {
             body="${uri#ss://}"
             ;;
         *)
-            error "无效的 SS2022 URI，应以 ss:// 开头"
+            error "无效的 SS URI，应以 ss:// 开头"
             return 1
             ;;
     esac
 
+    body="${body%%#*}"
     if [[ "$body" != *@* ]]; then
-        error "无效的 SS2022 URI，缺少服务器地址"
+        error "无效的 SS URI，缺少服务器地址"
         return 1
     fi
 
     encoded_credentials="${body%@*}"
-    endpoint="${body#*@}"
-    endpoint="${endpoint%%#*}"
+    endpoint="${body##*@}"
+    endpoint="${endpoint%/}"
+
+    encoded_credentials=$(printf '%s' "$encoded_credentials" | tr '_-' '/+')
+    case $(( ${#encoded_credentials} % 4 )) in
+        0) ;;
+        2) encoded_credentials+="==" ;;
+        3) encoded_credentials+="=" ;;
+        *) error "URI 中的认证信息不是有效 Base64"; return 1 ;;
+    esac
 
     if ! decoded_credentials=$(printf '%s' "$encoded_credentials" | base64 -d 2>/dev/null); then
         error "URI 中的认证信息不是有效 Base64"
+        return 1
+    fi
+
+    if [[ "$decoded_credentials" != *:* ]]; then
+        error "URI 中的认证信息缺少加密方式或密码分隔符"
         return 1
     fi
 
@@ -986,16 +1225,11 @@ parse_ss2022_uri() {
         return 1
     fi
 
-    if ! [[ "$URI_METHOD" =~ ^2022-blake3-(aes-128-gcm|aes-256-gcm|chacha20-poly1305)$ ]]; then
-        error "URI 使用了不支持的 SS2022 加密方式: $URI_METHOD"
-        return 1
-    fi
-
-    if [ "$URI_PORT" -lt 1 ] || [ "$URI_PORT" -gt 65535 ]; then
+    if ! URI_PORT=$(normalize_decimal "$URI_PORT" 1 65535); then
         error "URI 中的端口应为 1-65535"
         return 1
     fi
-    validate_ss2022_password "$URI_METHOD" "$URI_PASSWORD" || return 1
+    validate_ss_password "$URI_METHOD" "$URI_PASSWORD" || return 1
 }
 
 # --- 生成 Reality 密钥对 ---
@@ -1017,16 +1251,15 @@ generate_reality_keypair() {
     echo "$output"
 }
 
-# --- 添加 SS2022 节点 ---
-add_ss2022_node() {
+# --- 添加 SS / SS2022 节点 ---
+add_ss_node() {
     # 获取服务器地址
     get_server_address || return 1
     
     local tag port password method port_source
-    local config_backup meta_backup yaml_backup meta_existed=false yaml_existed=false
     
     # 端口自定义
-    read -r -p "请输入端口 (默认: 443): " port
+    read -r -p "请输入端口 (默认: 443): " port || return 1
     if [ -z "$port" ]; then
         port=443
         port_source="default"
@@ -1034,6 +1267,7 @@ add_ss2022_node() {
         port_source="custom"
     fi
 
+    port=$(normalize_decimal "$port" 1 65535) || { error "无效端口，应为 1-65535"; return 1; }
     check_port_available "$port" || return 1
 
     if [ "$port_source" = "default" ]; then
@@ -1043,7 +1277,7 @@ add_ss2022_node() {
     fi
     
     # 节点标签
-    read -r -p "请输入节点标签 (默认: ss-${port}): " tag
+    read -r -p "请输入节点标签 (默认: ss-${port}): " tag || return 1
     [ -z "$tag" ] && tag="ss-${port}"
     check_tag_available "$tag" || return 1
 
@@ -1051,7 +1285,9 @@ add_ss2022_node() {
     echo "1) 2022-blake3-aes-128-gcm"
     echo "2) 2022-blake3-aes-256-gcm"
     echo "3) 2022-blake3-chacha20-poly1305"
-    read -r -p "请选择加密方式 [1-3，默认: 1]: " method
+    echo "4) aes-128-gcm"
+    echo "5) aes-256-gcm"
+    read -r -p "请选择加密方式 [1-5，默认: 1]: " method || return 1
     case "${method:-1}" in
         1)
             method="2022-blake3-aes-128-gcm"
@@ -1062,22 +1298,28 @@ add_ss2022_node() {
         3)
             method="2022-blake3-chacha20-poly1305"
             ;;
+        4)
+            method="aes-128-gcm"
+            ;;
+        5)
+            method="aes-256-gcm"
+            ;;
         *)
-            error "无效的加密方式，请输入 1-3"
+            error "无效的加密方式，请输入 1-5"
             return 1
             ;;
     esac
     info "加密方法: $method"
     
     # 密码自定义
-    read -r -s -p "请输入密码 (留空自动生成): " password
+    IFS= read -r -s -p "请输入密码 (留空自动生成): " password || return 1
     echo
     if [ -z "$password" ]; then
-        password=$(generate_ss2022_key "$method") || { error "生成 SS2022 密钥失败"; return 1; }
-        [ -n "$password" ] || { error "生成 SS2022 密钥为空"; return 1; }
+        password=$(generate_ss_password "$method") || { error "生成 SS 密码失败"; return 1; }
+        [ -n "$password" ] || { error "生成 SS 密码为空"; return 1; }
         info "自动生成密码: $password"
     else
-        validate_ss2022_password "$method" "$password" || return 1
+        validate_ss_password "$method" "$password" || return 1
         info "使用自定义密码"
     fi
     
@@ -1098,38 +1340,7 @@ add_ss2022_node() {
                 "password": $password,
                 "network": "tcp,udp"
             }
-        }')
-    
-    # 添加到配置文件
-    local temp
-    config_backup=$(mktemp) || return 1
-    register_temp_file "$config_backup"
-    cp -p "$XRAY_CONFIG_PATH" "$config_backup" || return 1
-    if [ -f "$NODES_META_FILE" ]; then
-        meta_existed=true
-        meta_backup=$(mktemp) || return 1
-        register_temp_file "$meta_backup"
-        cp -p "$NODES_META_FILE" "$meta_backup" || return 1
-    fi
-    if [ -f "$YAML_NODES_FILE" ]; then
-        yaml_existed=true
-        yaml_backup=$(mktemp) || return 1
-        register_temp_file "$yaml_backup"
-        cp -p "$YAML_NODES_FILE" "$yaml_backup" || return 1
-    fi
-    temp=$(mktemp) || {
-        error "创建临时文件失败"
-        return 1
-    }
-    register_temp_file "$temp"
-    if ! jq --argjson inbound "$inbound" \
-        '.inbounds += [$inbound]' "$XRAY_CONFIG_PATH" > "$temp" || \
-        ! mv "$temp" "$XRAY_CONFIG_PATH"; then
-        rm -f "$temp"
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
-        error "写入 SS2022 配置失败"
-        return 1
-    fi
+        }') || return 1
     
     # Clash 节点和分享链接沿用原脚本格式；Xray 文档未确认第三方客户端格式。
     local share_link="" yaml_config="" client_config
@@ -1141,7 +1352,14 @@ add_ss2022_node() {
     raw_address="${raw_address%]}"
     yaml_server=$(yaml_scalar "$raw_address")
     yaml_password=$(yaml_scalar "$password")
-    share_link="ss://$(printf '%s' "${method}:${password}" | base64 | tr -d '\n')@${uri_address}:${port}#${encoded_tag}"
+    local encoded_credentials
+    encoded_credentials=$(printf '%s' "${method}:${password}" | base64 | tr -d '\r\n')
+    case "$method" in
+        aes-128-gcm|aes-256-gcm)
+            encoded_credentials=$(printf '%s' "$encoded_credentials" | tr '/+' '_-' | tr -d '=')
+            ;;
+    esac
+    share_link="ss://${encoded_credentials}@${uri_address}:${port}#${encoded_tag}"
     yaml_config="- {name: ${yaml_name}, type: ss, server: ${yaml_server}, port: ${port}, cipher: ${method}, password: ${yaml_password}, udp: true}"
     client_config=$(jq -n --arg tag "$tag" --arg address "${SERVER_IP#[}" \
         --arg port "$port" --arg method "$method" --arg password "$password" '
@@ -1149,26 +1367,12 @@ add_ss2022_node() {
             address: ($address | rtrimstr("]")), port: ($port | tonumber),
             method: $method, password: $password
         }}]}') || {
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
         return 1
     }
     
-    # 保存节点信息
-    if ! save_node_meta "$tag" "$share_link" "$yaml_config" "$client_config"; then
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
-        return 1
-    fi
-    
-    # 追加到 YAML 文件
-    if ! echo "$yaml_config" >> "$YAML_NODES_FILE"; then
-        error "写入 YAML 节点文件失败"
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
-        return 1
-    fi
+    commit_new_node "$inbound" "$tag" "$share_link" "$yaml_config" "$client_config" || return 1
 
-    rm -f "$config_backup" "$meta_backup" "$yaml_backup"
-    
-    success "SS2022 节点添加成功！"
+    success "SS 节点添加成功！"
     echo -e "\n${cyan}Shadowrocket 分享链接:${none}"
     printf '%s\n' "$share_link"
     echo -e "${cyan}Clash 节点（复制到 proxies）:${none}"
@@ -1181,10 +1385,9 @@ add_reality_node() {
     get_server_address || return 1
     
     local tag port uuid target domain private_key public_key short_id port_source
-    local config_backup meta_backup yaml_backup meta_existed=false yaml_existed=false
     
     # 端口自定义
-    read -r -p "端口 (默认: 443): " port
+    read -r -p "端口 (默认: 443): " port || return 1
     if [ -z "$port" ]; then
         port=443
         port_source="default"
@@ -1192,6 +1395,7 @@ add_reality_node() {
         port_source="custom"
     fi
 
+    port=$(normalize_decimal "$port" 1 65535) || { error "无效端口，应为 1-65535"; return 1; }
     check_port_available "$port" || return 1
 
     if [ "$port_source" = "default" ]; then
@@ -1201,12 +1405,12 @@ add_reality_node() {
     fi
     
     # 节点标签
-    read -r -p "请输入节点标签 (默认: vvr-${port}): " tag
+    read -r -p "请输入节点标签 (默认: vvr-${port}): " tag || return 1
     [ -z "$tag" ] && tag="vvr-${port}"
     check_tag_available "$tag" || return 1
     
     # UUID 自定义
-    read -r -p "请输入 UUID (留空自动生成): " uuid
+    read -r -p "请输入 UUID (留空自动生成): " uuid || return 1
     if [ -z "$uuid" ]; then
         if ! uuid=$(generate_uuid) || [ -z "$uuid" ]; then
             error "UUID 生成失败"
@@ -1266,18 +1470,18 @@ add_reality_node() {
     
     # SNI 域名自定义
     # 不把某个具体网站当成已确认可用的目标；由用户在服务器选择。
-    read -r -p "SNI（目标接受的域名，必填，不支持 * 通配符）: " domain
+    read -r -p "SNI（目标接受的域名，必填，不支持 * 通配符）: " domain || return 1
     if [ -z "$domain" ] || [[ "$domain" == *'*'* ]]; then
         error "请填写非空且不含 * 的 SNI"
         return 1
     fi
 
     # 官方现名 target；dest 仍被文档列为别名。这里采用现名。
-    read -r -p "target（默认: ${domain}:443）: " target
+    read -r -p "target（默认: ${domain}:443）: " target || return 1
     [ -z "$target" ] && target="${domain}:443"
     
     # Short ID 自定义
-    read -r -p "请输入 Short ID (留空自动生成): " short_id
+    read -r -p "请输入 Short ID (留空自动生成): " short_id || return 1
     if [ -z "$short_id" ]; then
         if command -v openssl >/dev/null 2>&1; then
             short_id=$(openssl rand -hex 4)
@@ -1329,38 +1533,7 @@ add_reality_node() {
                     "shortIds": [$short_id]
                 }
             }
-        }')
-    
-    # 添加到配置文件
-    local temp
-    config_backup=$(mktemp) || return 1
-    register_temp_file "$config_backup"
-    cp -p "$XRAY_CONFIG_PATH" "$config_backup" || return 1
-    if [ -f "$NODES_META_FILE" ]; then
-        meta_existed=true
-        meta_backup=$(mktemp) || return 1
-        register_temp_file "$meta_backup"
-        cp -p "$NODES_META_FILE" "$meta_backup" || return 1
-    fi
-    if [ -f "$YAML_NODES_FILE" ]; then
-        yaml_existed=true
-        yaml_backup=$(mktemp) || return 1
-        register_temp_file "$yaml_backup"
-        cp -p "$YAML_NODES_FILE" "$yaml_backup" || return 1
-    fi
-    temp=$(mktemp) || {
-        error "创建临时文件失败"
-        return 1
-    }
-    register_temp_file "$temp"
-    if ! jq --argjson inbound "$inbound" \
-        '.inbounds += [$inbound]' "$XRAY_CONFIG_PATH" > "$temp" || \
-        ! mv "$temp" "$XRAY_CONFIG_PATH"; then
-        rm -f "$temp"
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
-        error "写入 vless reality vision 配置失败"
-        return 1
-    fi
+        }') || return 1
     
     # 仅使用指定文档中的 VLESS 出站和 RealityObject 字段。
     local share_link="" yaml_config="" client_config
@@ -1381,11 +1554,10 @@ add_reality_node() {
     # 小火箭专用格式：只编码 auto:UUID@地址:端口，不编码协议头和查询参数。
     # tls=1 配合 pbk/sid 表示 REALITY，xtls=2 表示 Vision；默认使用 TCP。
     if ! encoded_authority=$(set -o pipefail; printf '%s' "auto:${uuid}@${uri_address}:${port}" | base64 | tr -d '\r\n'); then
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
         error "生成 Shadowrocket Base64 URI 失败"
         return 1
     fi
-    # 此链接同时用于终端显示和 save_node_meta 的 share_link 字段。
+    # 此链接同时用于终端显示和节点元数据的 share_link 字段。
     share_link="vless://${encoded_authority}?remark=${encoded_tag}&tls=1&xtls=2&sni=${encoded_domain}&fp=chrome&pbk=${encoded_public_key}&sid=${short_id}"
     # YAML 独立生成，继续明文保存；support-x25519mlkem768 位置沿用 reality-opts。
     yaml_config="- {name: ${yaml_name}, type: vless, server: ${yaml_server}, port: ${port}, uuid: ${yaml_uuid}, udp: true, tls: true, network: tcp, flow: xtls-rprx-vision, servername: ${yaml_domain}, client-fingerprint: chrome, reality-opts: {public-key: ${yaml_public_key}, short-id: ${yaml_short_id}, support-x25519mlkem768: true}}"
@@ -1399,25 +1571,11 @@ add_reality_node() {
             serverName: $domain, fingerprint: "chrome", password: $password,
             shortId: $short_id
         }}}]}') || {
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
         return 1
     }
     
-    # 保存节点信息
-    if ! save_node_meta "$tag" "$share_link" "$yaml_config" "$client_config"; then
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
-        return 1
-    fi
-    
-    # 追加到 YAML 文件
-    if ! echo "$yaml_config" >> "$YAML_NODES_FILE"; then
-        error "写入 YAML 节点文件失败"
-        restore_node_state "$config_backup" "$meta_backup" "$yaml_backup" "$meta_existed" "$yaml_existed"
-        return 1
-    fi
+    commit_new_node "$inbound" "$tag" "$share_link" "$yaml_config" "$client_config" || return 1
 
-    rm -f "$config_backup" "$meta_backup" "$yaml_backup"
-    
     success "vless reality vision 节点添加成功！"
     echo -e "\n${cyan}Shadowrocket 分享链接:${none}"
     printf '%s\n' "$share_link"
@@ -1473,104 +1631,35 @@ list_nodes() {
 
 # --- 删除节点 ---
 delete_node() {
-    if [ ! -f "$NODES_META_FILE" ]; then
-        info "暂无节点信息"
-        return 0
-    fi
-    
-    local node_count
-    node_count=$(jq '.nodes | length' "$NODES_META_FILE" 2>/dev/null || echo 0)
-    
-    if [ "$node_count" -eq 0 ]; then
-        info "暂无节点"
-        return 0
-    fi
-    
-    # 显示节点列表
+    if [ ! -f "$NODES_META_FILE" ]; then info "暂无节点信息"; return 0; fi
+    local node_count choice confirm delete_tag
+    node_count=$(jq -er '.nodes | length' "$NODES_META_FILE") || return 1
+    if [ "$node_count" -eq 0 ]; then info "暂无节点"; return 0; fi
     echo -e "\n${cyan}=== 选择要删除的节点 ===${none}\n"
-    
-    local index=1
-    local tags=()
-    
-    while IFS= read -r node; do
-        local tag=$(echo "$node" | jq -r '.tag')
-        tags+=("$tag")
-        echo -e "${green}[$index]${none} ${magenta}$tag${none}"
-        ((index++))
-    done < <(jq -r '.nodes[] | @json' "$NODES_META_FILE")
-    
-    echo -e "${red}[0]${none} 取消"
-    echo
-    
-    # 读取用户输入
-    local choice
-    read -r -p "请输入要删除的节点序号: " choice
-    
-    # 验证输入
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "$node_count" ]; then
-        error "无效的选择，请输入 0-${node_count} 之间的数字"
-        return 1
-    fi
-    
-    if [ "$choice" -eq 0 ]; then
-        info "已取消删除"
-        return 0
-    fi
-    
-    # 获取要删除的节点标签
-    local delete_tag="${tags[$((choice-1))]}"
-    
-    # 二次确认
-    read -r -p "确认删除节点 '${delete_tag}' ? [Y/n]: " confirm
-    if [[ "$confirm" =~ ^[Nn]$ ]]; then
-        info "已取消删除"
-        return 0
-    fi
-    
-    info "正在删除节点 '${delete_tag}'..."
-    
-    # 从 Xray 配置中删除 inbound
-    local temp
-    temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
-    register_temp_file "$temp"
-    
-    jq --arg tag "$delete_tag" \
-        'del(.inbounds[] | select(.tag == $tag))' \
-        "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
-    
-    if [ $? -ne 0 ]; then
-        error "从 Xray 配置删除失败"
-        rm -f "$temp"
-        return 1
-    fi
-    
-    # 从元数据文件中删除节点
-    temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
-    register_temp_file "$temp"
-    
-    jq --arg tag "$delete_tag" \
-        'del(.nodes[] | select(.tag == $tag))' \
-        "$NODES_META_FILE" > "$temp" && mv "$temp" "$NODES_META_FILE"
-    
-    if [ $? -ne 0 ]; then
-        error "从元数据删除失败"
-        rm -f "$temp"
-        return 1
-    fi
-    
-    # 重新生成 YAML 文件
-    cat > "$YAML_NODES_FILE" << 'EOF'
-# Clash 节点列表：复制节点到现有 YAML 的 proxies 部分
-# 客户端字段与 URI 格式按用户要求保留，兼容性需在客户端自行验证
+    jq -r '.nodes | to_entries[] | "[\(.key + 1)] \(.value.tag)"' "$NODES_META_FILE" || return 1
+    echo "[0] 取消"
+    read -r -p "请输入要删除的节点序号: " choice || return 1
+    choice=$(normalize_decimal "$choice" 0 "$node_count") || { error "无效的节点序号"; return 1; }
+    if [ "$choice" -eq 0 ]; then info "已取消删除"; return 0; fi
+    delete_tag=$(jq -er --argjson index "$((choice - 1))" '.nodes[$index].tag' "$NODES_META_FILE") || return 1
+    read -r -p "确认删除节点 '${delete_tag}' ? [Y/n]: " confirm || return 1
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then info "已取消删除"; return 0; fi
 
-EOF
-    
-    jq -r '.nodes[].yaml_config // empty | select(length > 0)' "$NODES_META_FILE" 2>/dev/null >> "$YAML_NODES_FILE"
-    
+    local config_candidate meta_candidate yaml_candidate
+    config_candidate=$(mktemp) || return 1
+    register_temp_file "$config_candidate"
+    meta_candidate=$(mktemp) || return 1
+    register_temp_file "$meta_candidate"
+    yaml_candidate=$(mktemp) || return 1
+    register_temp_file "$yaml_candidate"
+    jq --arg tag "$delete_tag" 'del(.inbounds[] | select(.tag == $tag))' \
+        "$XRAY_CONFIG_PATH" > "$config_candidate" || return 1
+    jq --arg tag "$delete_tag" 'del(.nodes[] | select(.tag == $tag))' \
+        "$NODES_META_FILE" > "$meta_candidate" || return 1
+    printf '%s\n\n' '# Clash 节点列表：复制节点到现有 YAML 的 proxies 部分' > "$yaml_candidate" || return 1
+    jq -r '.nodes[].yaml_config // empty | select(length > 0)' "$meta_candidate" >> "$yaml_candidate" || return 1
+    commit_xray_state "$config_candidate" "$meta_candidate" "$yaml_candidate" || return 1
     success "节点 '${delete_tag}' 已删除"
-    
-    # 直接重启服务
-    restart_xray
 }
 
 # --- 卸载 Xray ---
@@ -1585,7 +1674,11 @@ uninstall_xray() {
     echo "  - 全局命令 xrm"
     echo
     
-    read -r -p "确认完全卸载 Xray? [Y/n]: " confirm
+    local confirm
+    read -r -p "确认完全卸载 Xray? [Y/n]: " confirm || {
+        info "未收到确认，已取消卸载"
+        return 1
+    }
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消卸载"
         return 0
@@ -1649,6 +1742,14 @@ uninstall_xray() {
         info "正在删除节点元数据..."
         rm -f "$NODES_META_FILE"
     fi
+
+    if [ -f "$OUTBOUND_PROFILES_FILE" ]; then
+        info "正在删除出口配置档案..."
+        rm -f "$OUTBOUND_PROFILES_FILE" || {
+            error "删除出口配置档案失败"
+            return 1
+        }
+    fi
     
     # 删除配置目录（如果为空）
     if [ -d "$(dirname "$XRAY_CONFIG_PATH")" ]; then
@@ -1702,16 +1803,30 @@ restart_xray() {
 # --- 初始化出口配置文件 ---
 init_outbound_profiles() {
     if [ ! -f "$OUTBOUND_PROFILES_FILE" ]; then
-        echo '[]' > "$OUTBOUND_PROFILES_FILE"
+        local temp
+        temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
+        register_temp_file "$temp"
+        if ! printf '[]\n' > "$temp" || ! atomic_replace_file "$temp" "$OUTBOUND_PROFILES_FILE"; then
+            rm -f "$temp"
+            error "初始化出口配置失败"
+            return 1
+        fi
+    fi
+    if ! jq -e 'type == "array"' "$OUTBOUND_PROFILES_FILE" >/dev/null 2>&1; then
+        error "出口配置文件不是有效的 JSON 数组"
+        return 1
     fi
 }
 
-# --- 保存 SS2022 出口配置 ---
-save_ss2022_profile() {
+# --- 保存 SS / SS2022 出口配置 ---
+save_ss_profile() {
     local name="$1" server="$2" port="$3" password="$4"
     local method="${5:-2022-blake3-aes-128-gcm}"
     
-    init_outbound_profiles
+    [ -n "$name" ] && [ -n "$server" ] || { error "出口名称和服务器地址不能为空"; return 1; }
+    port=$(normalize_decimal "$port" 1 65535) || { error "无效的端口号"; return 1; }
+    validate_ss_password "$method" "$password" || return 1
+    init_outbound_profiles || return 1
     
     local temp
     temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
@@ -1732,7 +1847,7 @@ save_ss2022_profile() {
                "port": $port,
                "password": $password,
                "method": $method
-           } else . end)' "$OUTBOUND_PROFILES_FILE" > "$temp" && mv "$temp" "$OUTBOUND_PROFILES_FILE"
+            } else . end)' "$OUTBOUND_PROFILES_FILE" > "$temp" && atomic_replace_file "$temp" "$OUTBOUND_PROFILES_FILE"
     else
         # 添加新配置
         jq --arg name "$name" \
@@ -1746,7 +1861,7 @@ save_ss2022_profile() {
                "port": $port,
                "password": $password,
                "method": $method
-           }]' "$OUTBOUND_PROFILES_FILE" > "$temp" && mv "$temp" "$OUTBOUND_PROFILES_FILE"
+            }]' "$OUTBOUND_PROFILES_FILE" > "$temp" && atomic_replace_file "$temp" "$OUTBOUND_PROFILES_FILE"
     fi
     
     if [ $? -eq 0 ]; then
@@ -1764,16 +1879,17 @@ apply_direct_outbound() {
     temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
     register_temp_file "$temp"
 
-    jq '.outbounds = [
-           {
-               "tag": "direct",
-               "protocol": "freedom"
-           },
-           {
-               "tag": "block",
-               "protocol": "blackhole"
-           }
-       ]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+    # 首出站是未命中路由时的默认出口；保留现有 tag，避免破坏自定义路由引用。
+    jq '(.outbounds // []) as $outbounds |
+        if any($outbounds[]; .tag == "direct" and .protocol != "freedom") then
+            error("direct 标签已被非 freedom 出站使用")
+        else
+            ($outbounds | map(select(.tag == "direct")) | .[0] //
+                {tag: "direct", protocol: "freedom"}) as $direct |
+            .outbounds = ([$direct] + [$outbounds[] | select(.tag != "direct")] |
+                if any(.[]; .tag == "block") then .
+                else . + [{tag: "block", protocol: "blackhole"}] end)
+        end' "$XRAY_CONFIG_PATH" > "$temp" && commit_xray_config "$temp"
 
     if [ $? -eq 0 ]; then
         success "已切换到直连出口"
@@ -1785,9 +1901,12 @@ apply_direct_outbound() {
     fi
 }
 
-# --- 应用 SS2022 出口配置 ---
-apply_ss2022_outbound() {
+# --- 应用 SS / SS2022 出口配置 ---
+apply_ss_outbound() {
     local server="$1" port="$2" password="$3" method="${4:-2022-blake3-aes-128-gcm}"
+    [ -n "$server" ] || { error "服务器地址不能为空"; return 1; }
+    port=$(normalize_decimal "$port" 1 65535) || { error "无效的端口号"; return 1; }
+    validate_ss_password "$method" "$password" || return 1
     
     local temp
     temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
@@ -1797,25 +1916,26 @@ apply_ss2022_outbound() {
        --arg port "$port" \
        --arg password "$password" \
        --arg method "$method" \
-       '.outbounds = [
-           {
-               "tag": "proxy",
-               "protocol": "shadowsocks",
-               "settings": {
-                   "address": $server,
-                   "port": ($port | tonumber),
-                   "method": $method,
-                   "password": $password
-               }
-           },
-           {
-               "tag": "block",
-               "protocol": "blackhole"
-           }
-       ]' "$XRAY_CONFIG_PATH" > "$temp" && mv "$temp" "$XRAY_CONFIG_PATH"
+       '(.outbounds // []) as $outbounds |
+        if any($outbounds[]; .tag == "proxy" and .protocol != "shadowsocks") then
+            error("proxy 标签已被非 shadowsocks 出站使用")
+        else
+            (($outbounds | map(select(.tag == "proxy")) | .[0] //
+                {tag: "proxy", protocol: "shadowsocks"}) |
+                .settings = {
+                    address: $server,
+                    port: ($port | tonumber),
+                    method: $method,
+                    password: $password
+                }) as $proxy |
+            .outbounds = ([$proxy] + [$outbounds[] | select(.tag != "proxy")] |
+                if any(.[]; .tag == "block") then .
+                else . + [{tag: "block", protocol: "blackhole"}] end)
+        end' "$XRAY_CONFIG_PATH" > "$temp" && commit_xray_config "$temp"
     
     if [ $? -eq 0 ]; then
-        success "已切换到 SS2022 出口"
+        success "已切换到 SS 出口"
+        info "加密方法: $method"
         info "服务器: $server:$port"
         return 0
     else
@@ -1825,19 +1945,19 @@ apply_ss2022_outbound() {
     fi
 }
 
-# --- 查看已保存的 SS2022 配置 ---
-list_ss2022_profiles() {
-    init_outbound_profiles
+# --- 查看已保存的 SS / SS2022 配置 ---
+list_ss_profiles() {
+    init_outbound_profiles || return 1
     
     local count
-    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE")
+    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE") || return 1
     
     if [ "$count" -eq 0 ]; then
         info "暂无已保存的出口配置"
         return 1
     fi
     
-    echo -e "\n${cyan}=== 已保存的 SS2022 出口配置 ===${none}\n"
+    echo -e "\n${cyan}=== 已保存的 SS 出口配置 ===${none}\n"
     
     jq -r 'to_entries[] | "\(.key + 1)) \(.value.name) - \(.value.server):\(.value.port)"' "$OUTBOUND_PROFILES_FILE"
     
@@ -1846,73 +1966,84 @@ list_ss2022_profiles() {
 
 # --- 选择并应用已保存的配置 ---
 select_and_apply_profile() {
-    if ! list_ss2022_profiles; then
+    if ! list_ss_profiles; then
         return 1
     fi
     
     local count
-    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE")
+    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE") || return 1
     
     echo
-    read -r -p "请选择配置编号 [1-$count] (0 返回): " choice
+    local choice
+    read -r -p "请选择配置编号 [1-$count] (0 返回): " choice || return 1
     
     if [ "$choice" = "0" ]; then
         return 0
     fi
     
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+    if ! choice=$(normalize_decimal "$choice" 1 "$count"); then
         error "无效的选择"
         return 1
     fi
     
-    local index=$((choice - 1))
+    local index=$((10#$choice - 1))
     local profile
-    profile=$(jq -r ".[$index]" "$OUTBOUND_PROFILES_FILE")
+    profile=$(jq -ce --argjson index "$index" '.[$index] |
+        select(type == "object" and (.name | type == "string") and
+            (.server | type == "string") and (.password | type == "string") and
+            (.port | type == "string" or type == "number"))' "$OUTBOUND_PROFILES_FILE") || {
+        error "出口配置记录无效"
+        return 1
+    }
     
     local name server port password method
-    name=$(echo "$profile" | jq -r '.name')
-    server=$(echo "$profile" | jq -r '.server')
-    port=$(echo "$profile" | jq -r '.port')
-    password=$(echo "$profile" | jq -r '.password')
-    method=$(echo "$profile" | jq -r '.method // "2022-blake3-aes-128-gcm"')
+    name=$(printf '%s' "$profile" | jq -r '.name')
+    server=$(printf '%s' "$profile" | jq -r '.server')
+    port=$(printf '%s' "$profile" | jq -r '.port')
+    password=$(printf '%s' "$profile" | jq -r '.password')
+    method=$(printf '%s' "$profile" | jq -r '.method // "2022-blake3-aes-128-gcm"')
     
     info "正在应用配置: $name"
     
-    if apply_ss2022_outbound "$server" "$port" "$password" "$method"; then
-        restart_xray
-    fi
+    apply_ss_outbound "$server" "$port" "$password" "$method"
 }
 
-# --- 删除已保存的 SS2022 配置 ---
-delete_ss2022_profile() {
-    if ! list_ss2022_profiles; then
+# --- 删除已保存的 SS / SS2022 配置 ---
+delete_ss_profile() {
+    if ! list_ss_profiles; then
         return 1
     fi
     
     local count
-    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE")
+    count=$(jq 'length' "$OUTBOUND_PROFILES_FILE") || return 1
     
     echo
-    read -r -p "请选择要删除的配置编号 [1-$count] (0 返回): " choice
+    local choice
+    read -r -p "请选择要删除的配置编号 [1-$count] (0 返回): " choice || return 1
     
     if [ "$choice" = "0" ]; then
         return 0
     fi
     
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "$count" ]; then
+    if ! choice=$(normalize_decimal "$choice" 1 "$count"); then
         error "无效的选择"
         return 1
     fi
     
-    local index=$((choice - 1))
+    local index=$((10#$choice - 1))
     local profile
-    profile=$(jq -r ".[$index]" "$OUTBOUND_PROFILES_FILE")
+    profile=$(jq -ce --argjson index "$index" '.[$index] |
+        select(type == "object" and (.name | type == "string"))' "$OUTBOUND_PROFILES_FILE") || {
+        error "出口配置记录无效"
+        return 1
+    }
     
     local name
-    name=$(echo "$profile" | jq -r '.name')
+    name=$(printf '%s' "$profile" | jq -r '.name')
     
     # 二次确认
-    read -r -p "确认删除配置 '$name'? [Y/n]: " confirm
+    local confirm
+    read -r -p "确认删除配置 '$name'? [Y/n]: " confirm || return 1
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消删除"
         return 0
@@ -1922,7 +2053,8 @@ delete_ss2022_profile() {
     temp=$(mktemp) || { error "创建临时文件失败"; return 1; }
     register_temp_file "$temp"
     
-    jq "del(.[$index])" "$OUTBOUND_PROFILES_FILE" > "$temp" && mv "$temp" "$OUTBOUND_PROFILES_FILE"
+    jq --argjson index "$index" 'del(.[$index])' "$OUTBOUND_PROFILES_FILE" > "$temp" &&
+        atomic_replace_file "$temp" "$OUTBOUND_PROFILES_FILE"
     
     if [ $? -eq 0 ]; then
         success "配置 '$name' 已删除"
@@ -1947,44 +2079,40 @@ change_outbound() {
         echo "0) 返回主菜单"
         echo
 
-        read -r -p "请选择操作 [0-5]: " outbound_choice
+        read -r -p "请选择操作 [0-5]: " outbound_choice || return 1
 
         case "$outbound_choice" in
         1)
             # 直连出口
             info "正在配置直连出口..."
-            if apply_direct_outbound; then
-                restart_xray
-            else
-                return 1
-            fi
+            apply_direct_outbound || return 1
             ;;
         2)
-            # 添加新的 SS2022 出口
-            info "添加 SS2022 出口"
+            # 添加新的 SS / SS2022 出口
+            info "添加 SS 出口"
             echo
 
-            echo "1) 粘贴 SS2022 URI"
+            echo "1) 粘贴 SS URI（含 SS2022）"
             echo "2) 手动填写"
-            read -r -p "请选择配置方式 [1-2]: " profile_input_mode
+            read -r -p "请选择配置方式 [1-2]: " profile_input_mode || return 1
 
             local ss_name ss_server ss_port ss_password ss_method
             if [ "$profile_input_mode" = "1" ]; then
-                read -r -p "请粘贴 SS2022 URI: " ss_uri
-                parse_ss2022_uri "$ss_uri" || continue
+                read -r -p "请粘贴 SS URI: " ss_uri || return 1
+                parse_ss_uri "$ss_uri" || continue
                 ss_server="$URI_SERVER"
                 ss_port="$URI_PORT"
                 ss_password="$URI_PASSWORD"
                 ss_method="$URI_METHOD"
-                read -r -p "配置名称 (用于保存，默认: ss-${ss_port}): " ss_name
+                read -r -p "配置名称 (用于保存，默认: ss-${ss_port}): " ss_name || return 1
                 [ -z "$ss_name" ] && ss_name="ss-${ss_port}"
             elif [ "$profile_input_mode" = "2" ]; then
-                read -r -p "配置名称 (用于保存): " ss_name
+                read -r -p "配置名称 (用于保存): " ss_name || return 1
                 if [ -z "$ss_name" ]; then
                     error "配置名称不能为空"
                     continue
                 fi
-                read -r -p "服务器地址: " ss_server
+                read -r -p "服务器地址: " ss_server || return 1
                 if [ -z "$ss_server" ]; then
                     error "服务器地址不能为空"
                     continue
@@ -1993,7 +2121,9 @@ change_outbound() {
                 echo "1) 2022-blake3-aes-128-gcm"
                 echo "2) 2022-blake3-aes-256-gcm"
                 echo "3) 2022-blake3-chacha20-poly1305"
-                read -r -p "请选择加密方式 [1-3，默认: 1]: " ss_method
+                echo "4) aes-128-gcm"
+                echo "5) aes-256-gcm"
+                read -r -p "请选择加密方式 [1-5，默认: 1]: " ss_method || return 1
                 case "${ss_method:-1}" in
                     1)
                         ss_method="2022-blake3-aes-128-gcm"
@@ -2004,31 +2134,37 @@ change_outbound() {
                     3)
                         ss_method="2022-blake3-chacha20-poly1305"
                         ;;
+                    4)
+                        ss_method="aes-128-gcm"
+                        ;;
+                    5)
+                        ss_method="aes-256-gcm"
+                        ;;
                     *)
-                        error "无效的加密方式，请输入 1-3"
+                        error "无效的加密方式，请输入 1-5"
                         continue
                         ;;
                 esac
 
-                read -r -p "端口: " ss_port
-                if [ -z "$ss_port" ] || ! [[ "$ss_port" =~ ^[0-9]+$ ]] || [ "$ss_port" -lt 1 ] || [ "$ss_port" -gt 65535 ]; then
+                read -r -p "端口: " ss_port || return 1
+                if ! ss_port=$(normalize_decimal "$ss_port" 1 65535); then
                     error "无效的端口号"
                     continue
                 fi
-                read -r -s -p "密码: " ss_password
+                IFS= read -r -s -p "密码: " ss_password || return 1
                 echo
                 if [ -z "$ss_password" ]; then
                     error "密码不能为空"
                     continue
                 fi
-                validate_ss2022_password "$ss_method" "$ss_password" || continue
+                validate_ss_password "$ss_method" "$ss_password" || continue
             else
                 error "无效的配置方式"
                 continue
             fi
 
             info "加密方法: $ss_method"
-            if save_ss2022_profile "$ss_name" "$ss_server" "$ss_port" "$ss_password" "$ss_method"; then
+            if save_ss_profile "$ss_name" "$ss_server" "$ss_port" "$ss_password" "$ss_method"; then
                 info "配置已保存，请使用选项 3 选择并应用配置"
             fi
             ;;
@@ -2038,11 +2174,11 @@ change_outbound() {
             ;;
         4)
             # 查看已保存的配置
-            list_ss2022_profiles
+            list_ss_profiles
             ;;
         5)
             # 删除已保存的配置
-            delete_ss2022_profile
+            delete_ss_profile
             ;;
         0)
             return 0
@@ -2064,7 +2200,7 @@ manage_nodes() {
         echo
 
         local node_management_choice
-        read -r -p "请选择操作 [0-2]: " node_management_choice
+        read -r -p "请选择操作 [0-2]: " node_management_choice || return 1
 
         case "$node_management_choice" in
         1)
@@ -2087,20 +2223,20 @@ manage_nodes() {
 add_node_menu() {
     while true; do
         echo -e "\n${cyan}=== 新增节点 ===${none}\n"
-        echo "1) SS2022 节点"
+        echo "1) SS 节点（含 SS2022）"
         echo "2) vless reality vision 节点"
         echo "0) 返回主菜单"
         echo
 
         local node_choice
-        read -r -p "请选择节点类型 [0-2]: " node_choice
+        read -r -p "请选择节点类型 [0-2]: " node_choice || return 1
 
         case "$node_choice" in
         1)
-            add_ss2022_node && restart_xray
+            add_ss_node
             ;;
         2)
-            add_reality_node && restart_xray
+            add_reality_node
             ;;
         0)
             return 0
@@ -2124,7 +2260,7 @@ manage_xray() {
         echo "0) 返回主菜单"
         echo
         local management_choice
-        read -r -p "请选择操作 [0-5]: " management_choice
+        read -r -p "请选择操作 [0-5]: " management_choice || return 1
         case "$management_choice" in
             1) upgrade_xray ;;
             2) restart_xray ;;
@@ -2257,7 +2393,7 @@ show_status() {
 main() {
     umask 077
     trap cleanup_temp_files EXIT
-    trap 'cleanup_temp_files; exit 130' INT TERM
+    trap handle_interrupt INT TERM
 
     check_root
     detect_os
@@ -2269,7 +2405,8 @@ main() {
     # 初始化配置
     init_config || exit 1
 
-    chmod 600 "$XRAY_CONFIG_PATH" "$YAML_NODES_FILE" "$NODES_META_FILE" "$OUTBOUND_PROFILES_FILE" 2>/dev/null || true
+    # 保留既有配置的所有者和权限，兼容以非 root 用户运行的 Xray 服务。
+    chmod 600 "$YAML_NODES_FILE" "$NODES_META_FILE" "$OUTBOUND_PROFILES_FILE" 2>/dev/null || true
 
     # 仅在启动时确保一次路由策略
     ensure_routing_policy || exit 1
@@ -2282,7 +2419,7 @@ main() {
     # 主循环
     while true; do
         show_menu
-        read -r -p "请选择操作 [0-5]: " choice
+        read -r -p "请选择操作 [0-5]: " choice || break
         
         case $choice in
             1)
